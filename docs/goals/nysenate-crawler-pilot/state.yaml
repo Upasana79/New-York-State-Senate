@@ -1,0 +1,397 @@
+# GoalBuddy v2 state.yaml
+# Board truth lives here. goal.md is the editable charter; notes/ holds long receipts only.
+
+version: 2
+
+goal:
+  title: "NYSenate Crawler Pilot"
+  slug: "nysenate-crawler-pilot"
+  kind: existing_plan
+  tranche: "Validate the updated Playwright-first handoff, implement the one-title NYSenate pilot crawler, verify XML/log behavior, and audit against the pilot oracle."
+  status: done
+  oracle:
+    signal: "A bounded local pilot run discovers title links from the root page, crawls exactly the first title URL returned by that loop, uses Playwright-rendered DOM extraction, recursively traverses child pages by depth, emits XML leaf records with sourceURL/levels/contents/revision metadata, and then stops the root title loop."
+    cadence: "after each Worker package and at final audit"
+    final_proof: "Receipt-backed changed files, focused test or run commands, generated XML/log inspection, and final Judge/PM audit with full_outcome_complete: true."
+  intake:
+    original_request: "Prepare and repair a GoalBuddy board for docs/nysenate_crawler_algorithm_notes.md after the handoff changed to a Playwright-first crawler plan."
+    interpreted_outcome: "Turn the updated NYSenate scraper handoff into an execution board that reliably guides a later /goal run through validation, implementation, and proof."
+    input_shape: existing_plan
+    audience: "repository owner and future scraper maintainers"
+    authority: requested
+    proof_type: artifact
+    completion_proof: "A Python one-title pilot crawler exists, runs locally in bounded pilot mode, discovers title links from the root page, crawls exactly the first title URL returned by that loop without hard-coding any law code, emits valid XML leaf records with sourceURL, level10-level100, visible revision metadata when available, and non-empty contents, and passes focused verification."
+    likely_misfire: "Shipping a hard-coded, shallow, static-first, or over-broad scraper that emits sample-looking XML while violating the updated handoff's Playwright-first, child-links-first, one-title pilot, or dynamic-level requirements."
+    blind_spots_considered:
+      - "Live site behavior may require Playwright waits, persistent browser context, cookie/modal cleanup, or Chrome/session fallback."
+      - "Selectors may drift, so the implementation should make NYSenate selectors configurable."
+      - "The repo's existing structure, dependencies, and verification commands must be discovered before choosing write paths."
+      - "The pilot must include max-page/max-document safeguards to avoid accidental broad crawling."
+      - "levels.pdf is referenced by the handoff but may be absent; Scout should verify availability and record the consequence."
+      - "Debug HTML/screenshots should be targeted to failures, not captured repeatedly as the main scraping strategy."
+    existing_plan_facts:
+      - "docs/nysenate_crawler_algorithm_notes.md is the durable handoff and current source of implementation tips/tricks."
+      - "Earlier approval HTML/MD files were deleted and should not be rebuilt unless requested."
+      - "Build a Python scraper for https://www.nysenate.gov/legislation/laws/CONSOLIDATED."
+      - "Pilot scope is one title URL only: discover title links from the root page, crawl the first title URL returned by that loop, then stop."
+      - "Root rows are discovery only; do not emit root rows and do not capture level10 from root rows."
+      - "Capture the current page title into the next available depth level, then check relevant child links before leaf emission."
+      - "Child links beat leaf detection."
+      - "Levels are assigned by crawl depth, not by semantic legal label."
+      - "Levels run from level10 through level100; empty deeper levels are acceptable; paths beyond level100 must be flagged for schema review."
+      - "Navigation/index pages carry levels forward and queue child URLs but do not emit XML records."
+      - "Leaf/content pages emit XML only when there are no relevant child links and legal text exists."
+      - "Required output fields are sourceURL, visible revision metadata when available, level10-level100, and contents."
+      - "Use the listed NYSenate selectors as first implementation targets and keep them configurable."
+      - "Use Playwright first for page loading and rendered-DOM extraction."
+      - "Use selectors, scoped locators, or bounded DOM evaluation; do not rely on fixed coordinates or screenshots for extraction."
+      - "Borrow useful AO scraper practices where appropriate: persistent browser context, realistic waits, retry/backoff, rendered-DOM extraction, cookie/modal cleanup, visited/failed tracking, incremental writes, and targeted debug artifacts."
+      - "Use a YAML config shaped like the AO config for browser, targets, files, timing, selectors, debug, and validation settings."
+      - "Keep visited_urls and failed_urls, log each URL/captured level/child count/emit-skip decision, and write XML incrementally."
+      - "Save debug HTML/screenshots only when a page is blocked, empty, malformed, or fails validation."
+      - "If CAPTCHA or explicit human verification appears, pause for user/manual resolution and record it in logs."
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 1
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+  planning_is_not_completion: true
+  queued_required_worker_blocks_completion: true
+  continuous_until_full_outcome: true
+  missing_input_or_credentials_do_not_stop_goal: true
+  preserve_and_validate_existing_plan: true
+  intake_misfire_must_be_audited: true
+  goal_pressure_requires_oracle: true
+  no_completion_on_weak_proof: true
+  slice_policy:
+    max_consecutive_tiny_tasks: 2
+    prefer_vertical_slices: true
+    judge_picks_largest_safe_slice: true
+    worker_completes_whole_slice: true
+
+agents:
+  scout: installed
+  worker: installed
+  judge: installed
+
+visual_board:
+  selected: local
+  local:
+    status: live
+    url: "http://goalbuddy.localhost:41737/nysenate-crawler-pilot/"
+    command: "npx -y --ignore-scripts goalbuddy board docs/goals/nysenate-crawler-pilot"
+
+active_task: null
+
+tasks:
+  - id: T001
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: default
+    objective: "Validate the updated NYSenate crawler handoff against repository structure, reference materials, dependencies, and verification options."
+    inputs:
+      - "docs/nysenate_crawler_algorithm_notes.md"
+      - "Learnings from last scrapper/Advice.md"
+      - "levels.pdf if present"
+      - "Reference code 1/config_ao.yaml"
+      - "Reference code 1/ao_scrapper.py"
+      - "README.md"
+      - "requirements*.txt"
+      - "pyproject.toml"
+      - "setup.cfg"
+      - "pytest.ini"
+      - "existing scraper/source/test/config directories discovered in the repo"
+    constraints:
+      - "Read-only."
+      - "Do not edit implementation files."
+      - "Preserve the handoff's existing plan facts rather than rediscovering the goal from scratch."
+      - "Treat docs/nysenate_crawler_algorithm_notes.md as the authority when references disagree."
+      - "Verify whether referenced files exist; record missing references without blocking if the handoff is otherwise sufficient."
+      - "Do not crawl the full NYSenate site during Scout; any live check must be minimal and directly tied to implementation feasibility."
+    expected_output:
+      - "Repo map relevant to the scraper."
+      - "Reference availability summary, including whether levels.pdf exists."
+      - "Recommended implementation files, config files, output paths, and test locations."
+      - "Playwright/browser dependencies and whether existing repo tooling supports them."
+      - "How to apply AO scraper/config patterns without overriding NYSenate crawl semantics."
+      - "Bounded verification commands for unit tests and a one-title pilot run."
+      - "Risks or ambiguities that should affect Worker allowed_files, verify, or stop_if."
+    receipt:
+      result: done
+      summary: "Repo is a handoff/reference workspace with no existing Python scraper package, tests, README, requirements, pyproject, setup.cfg, or pytest.ini. The authoritative NYSenate handoff and AO references are present; levels.pdf is absent. A minimal static root-page request returned HTTP 403, supporting the Playwright-first/persistent-browser direction."
+      evidence:
+        - "docs/nysenate_crawler_algorithm_notes.md"
+        - "Learnings from last scrapper/Advice.md"
+        - "Reference code 1/config_ao.yaml"
+        - "Reference code 1/ao_scrapper.py"
+        - "Reference code 1/Project Status Report_03.06.26_6.15pm"
+        - "No README.md, requirements.txt, pyproject.toml, setup.cfg, pytest.ini, or levels.pdf found."
+        - "Python 3.12 is on PATH; playwright, PyYAML, and pytest are not installed in PATH Python; lxml and bs4 are available in PATH Python."
+        - "Bundled Python has lxml only among checked scraper/test dependencies; node exists only through the bundled runtime, while npm/npx are not on shell PATH. The GoalBuddy board is already live."
+      recommended_files:
+        - "requirements.txt"
+        - "config/nysenate_crawler.yaml"
+        - "src/nysenate_crawler/__init__.py"
+        - "src/nysenate_crawler/pilot_crawler.py"
+        - "tests/test_nysenate_pilot_crawler.py"
+      implementation_notes:
+        - "Use docs/nysenate_crawler_algorithm_notes.md as authority over AO references."
+        - "Create a first Python package rather than modifying an existing scraper."
+        - "Borrow AO patterns for persistent context, retries/backoff, rendered-DOM extraction, obstacle cleanup, visited/failed tracking, logging, and failure-only debug artifacts."
+        - "Do not copy AO's product CSV shape, Cloudflare-clicking behavior, or broad concurrent crawl model into the NYSenate pilot."
+        - "Use data/, logs/, and debug artifact paths that are already covered by .gitignore."
+      bounded_verification:
+        - "python -m unittest discover -s tests"
+        - "python -m nysenate_crawler.pilot_crawler --config config/nysenate_crawler.yaml --max-documents 1 --headless true"
+      risks:
+        - "Playwright and PyYAML must be installed before a live pilot run can execute in this environment."
+        - "Browser binaries may need python -m playwright install chromium before live verification."
+        - "The NYSenate root may block simple HTTP clients, so Worker verification should use Playwright and stop on CAPTCHA or explicit human verification."
+        - "Because levels.pdf is absent, it should be treated as unavailable evidence, not a blocker against the current handoff."
+  - id: T002
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Turn Scout findings and the updated handoff into the largest safe useful Worker package for the Playwright-first pilot crawler."
+    inputs:
+      - "T001 receipt"
+      - "docs/nysenate_crawler_algorithm_notes.md"
+      - "Reference availability and repo conventions identified by Scout"
+    constraints:
+      - "Do not implement."
+      - "Do not choose a static-first implementation unless the updated handoff is explicitly changed again."
+      - "Do not shrink to tiny helper-only work unless dependency or repo evidence makes the full pilot slice unsafe."
+      - "The selected Worker package must prevent broad crawling and hard-coded sample law data."
+      - "The Worker package must include explicit XML and level verification, not only a smoke run."
+      - "If Scout evidence is insufficient to specify XML/level verification, return revise with the exact missing evidence and a follow-up Scout/Judge task."
+    expected_output:
+      - "Decision: approved | revise | blocked"
+      - "Exact Worker objective"
+      - "allowed_files"
+      - "verify commands"
+      - "stop_if conditions"
+      - "Required config/output/log/test expectations"
+      - "How the Worker should apply the handoff's Playwright/AO tips without changing XML hierarchy semantics"
+      - "XML/level acceptance checklist the Worker must satisfy"
+      - "Corrective loop instructions if verification shows missing fields, wrong levels, emitted index pages, over-crawl, or hard-coded sample law data"
+      - "Any deferred tasks"
+    receipt:
+      result: done
+      decision: approved
+      full_outcome_complete: false
+      summary: "Approve one vertical Worker package to create the first Playwright-first NYSenate pilot crawler, YAML config, dependency manifest, and focused unit verification. The repo has no existing package to preserve, and the handoff is specific enough for implementation."
+      worker_objective: "Implement a Playwright-first one-title NYSenate pilot crawler with recursive depth-carried levels, XML leaf emission, incremental persistence, logging, YAML configuration, bounded crawl safeguards, failure-only debug artifacts, and focused tests."
+      allowed_files:
+        - "requirements.txt"
+        - "config/nysenate_crawler.yaml"
+        - "src/nysenate_crawler/__init__.py"
+        - "src/nysenate_crawler/pilot_crawler.py"
+        - "tests/test_nysenate_pilot_crawler.py"
+      verify:
+        - "python -m unittest discover -s tests"
+        - "$env:PYTHONPATH='src'; python -m nysenate_crawler.pilot_crawler --config config/nysenate_crawler.yaml --max-documents 1 --headless true"
+      stop_if:
+        - "Need to write files outside allowed_files."
+        - "Playwright/PyYAML/browser installation is unavailable and blocks the live run after unit tests pass."
+        - "A live page shows CAPTCHA or explicit human verification."
+        - "The implementation would hard-code ABC, any law code, sample URLs, legal labels, fixed screen coordinates, or fixed depth."
+        - "The implementation would crawl beyond the first root-discovered title in pilot mode."
+        - "Verification fails twice for the same underlying reason."
+      required_config_output_log_test_expectations:
+        - "Config includes browser, targets, files, timing, selectors, debug, and validation groups."
+        - "Output XML root is nysenateDocuments with metadata and documents/document children."
+        - "Each document contains sourceURL, revision metadata when visible, level10 through level100, and contents."
+        - "Unused deeper levels are emitted as empty strings."
+        - "Root rows are discovery only; selected law page starts level10."
+        - "Navigation/index pages with relevant child links are skipped as emitted documents."
+        - "Logs include URL, captured level, child count, and emit/skip decision."
+        - "Pilot safeguards include pilot_title_limit, max_pages, max_documents, visited_urls, and failed_urls."
+      xml_level_acceptance_checklist:
+        - "No hard-coded law code or sample URL controls traversal."
+        - "Root page title rows do not populate level10."
+        - "Current page title is captured by depth before child inspection."
+        - "Child links beat leaf/content emission."
+        - "Depth maps dynamically through level100 and flags paths beyond level100."
+        - "Only leaves with legal text emit XML records."
+        - "Generated XML can be parsed and documents contain sourceURL, levels, revision field, and non-empty contents."
+      corrective_loop: "If tests or live run show wrong levels, emitted index pages, missing fields, over-crawl, hard-coded sample data, or weak logs, update or spawn the next Worker package inside the same allowed implementation surface unless a stop condition applies."
+  - id: T003
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: default
+    objective: "Implement the Playwright-first one-title NYSenate pilot crawler and focused verification selected by Judge."
+    allowed_files:
+      - "requirements.txt"
+      - "config/nysenate_crawler.yaml"
+      - "src/nysenate_crawler/__init__.py"
+      - "src/nysenate_crawler/pilot_crawler.py"
+      - "tests/test_nysenate_pilot_crawler.py"
+    verify:
+      - "python -m unittest discover -s tests"
+      - "$env:PYTHONPATH='src'; python -m nysenate_crawler.pilot_crawler --config config/nysenate_crawler.yaml --max-documents 1 --headless true"
+    stop_if:
+      - "Need files outside Judge-approved allowed_files."
+      - "Repo conventions or dependencies contradict the handoff in a way that changes output shape, crawl semantics, or pilot scope."
+      - "The implementation would crawl more than the first title URL returned by the root-page title-link loop in pilot mode."
+      - "The implementation would hard-code ABC, any law code, sample URLs, legal labels, fixed screen coordinates, or fixed depth."
+      - "Playwright/browser-context setup and Chrome/session fallback both fail in a way that requires external credentials, policy decisions, CAPTCHA solving, or broad live-site probing."
+      - "Verification fails twice for the same underlying reason."
+    receipt:
+      result: done
+      changed_files:
+        - "requirements.txt"
+        - "config/nysenate_crawler.yaml"
+        - "src/nysenate_crawler/__init__.py"
+        - "src/nysenate_crawler/pilot_crawler.py"
+        - "tests/test_nysenate_pilot_crawler.py"
+      runtime_artifacts:
+        - "data/nysenate_consolidated_laws_pilot.xml"
+        - "data/nysenate_visited_urls.txt"
+        - "data/nysenate_failed_urls.txt"
+        - "logs/nysenate_crawler.log"
+      commands:
+        - cmd: "python -m pip install -r requirements.txt"
+          status: pass
+        - cmd: "python -m playwright install chromium"
+          status: pass
+        - cmd: "python -m unittest discover -s tests"
+          status: pass
+        - cmd: "$env:PYTHONPATH='src'; python -m nysenate_crawler.pilot_crawler --config config/nysenate_crawler.yaml --max-documents 1 --headless true"
+          status: pass
+        - cmd: "XML parse/field inspection for data/nysenate_consolidated_laws_pilot.xml"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+      summary: "Implemented a Playwright-first Python pilot crawler with YAML configuration, recursive level-carrying traversal, one-title root discovery, max-page/max-document safeguards, visited/failed checkpoints, incremental XML writing, logging, failure-only debug capture, and focused unittest coverage. The live bounded run discovered 94 root title links, selected the first title ABC without hard-coding it, visited ABC -> ABC/A1 -> ABC/1, emitted exactly one leaf XML document, and reported zero failures."
+      verification_evidence:
+        - "Generated XML root is nysenateDocuments with metadata totalDocuments=1 and pilotLaw=ABC."
+        - "Document sourceURL is https://www.nysenate.gov/legislation/laws/ABC/1."
+        - "revisionDate is VIEWING MOST RECENT REVISION (FROM 2014-09-22)."
+        - "level10 is CHAPTER 3-B Alcoholic Beverage Control."
+        - "level20 is ARTICLE 1 Short Title; Policy of State and Purpose of Chapter: Definitions Alcoholic Beverage Control (ABC) CHAPTER 3-B."
+        - "level30 is SECTION 1 Short title Alcoholic Beverage Control (ABC) CHAPTER 3-B, ARTICLE 1."
+        - "level40 through level100 are present and empty for the shallow leaf path."
+        - "contents length is 119 and contains the legal text for Section 1."
+        - "Log shows ABC and ABC/A1 skipped as navigation pages due to child links, then ABC/1 emitted as a leaf."
+      notes:
+        - "Playwright and PyYAML were installed into the active Python 3.12 environment, and Chromium was installed with python -m playwright install chromium."
+        - "git diff --check passed with only a Git CRLF warning for pre-existing .gitignore line-ending normalization."
+  - id: T004
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Audit XML, dynamic levels, traversal, pilot scope, and logs against the updated handoff; if incomplete, define the next corrective Worker loop."
+    inputs:
+      - "T003 receipt"
+      - "Changed files"
+      - "Verification output"
+      - "Generated XML artifact from a bounded pilot run, if produced"
+      - "Crawler logs from a bounded pilot run, if produced"
+      - "docs/nysenate_crawler_algorithm_notes.md"
+    constraints:
+      - "Do not implement."
+      - "Reject completion if the crawler is static-first, hard-codes sample law data, emits index pages, skips deeper child traversal, omits required fields, lacks one-title stop behavior, or lacks bounded crawl safeguards."
+      - "Reject completion if debug screenshots/HTML are used as the main extraction strategy instead of failure-only evidence."
+      - "Inspect XML structure for root metadata, document records, sourceURL, revision metadata when visible, level10-level100, non-empty contents, and empty strings for unused deeper levels."
+      - "Inspect level semantics: root rows must not become level10, each crawled page title must be assigned by depth, child links must be checked before leaf emission, and legal labels must not be hard-coded to fields."
+      - "Inspect traversal evidence: navigation/index pages must not be emitted, leaf documents must have no relevant child links, paths beyond level100 must be flagged, and visited-path cycle protection must exist."
+      - "If any XML/level/traversal/pilot-scope proof is missing, do not only report failure; specify the exact next Worker package needed to fix or prove it."
+    expected_output:
+      - "complete | not_complete"
+      - "full_outcome_complete: true | false"
+      - "XML checklist: pass | fail with evidence"
+      - "Level checklist: pass | fail with evidence"
+      - "Traversal/pilot-scope checklist: pass | fail with evidence"
+      - "Evidence mapped to the oracle"
+      - "If not_complete: exact corrective Worker objective"
+      - "If not_complete: allowed_files for corrective Worker"
+      - "If not_complete: verify commands for corrective Worker"
+      - "If not_complete: stop_if conditions for corrective Worker"
+      - "If not_complete: PM board update recommendation to activate/update/spawn the corrective Worker task"
+    receipt:
+      result: done
+      decision: complete
+      full_outcome_complete: true
+      xml_checklist: pass
+      level_checklist: pass
+      traversal_pilot_scope_checklist: pass
+      summary: "The implemented crawler and generated pilot artifacts satisfy the XML, dynamic level, traversal, and pilot-scope requirements from the updated handoff. No corrective Worker loop is needed."
+      evidence:
+        - "Source/config grep found no hard-coded ABC, Alcoholic, A1, CHAPTER 3-B, or sample URL in implementation/config; the only source of ABC was the live root discovery runtime result."
+        - "XML parse confirms root=nysenateDocuments, metadata totalDocuments=1, and exactly one document."
+        - "All required document tags are present: sourceURL, revisionDate, level10-level100, and contents."
+        - "level10, level20, and level30 are populated by crawl depth; level40-level100 are present and empty on the shallow path."
+        - "sourceURL is the leaf page https://www.nysenate.gov/legislation/laws/ABC/1, not a root/index page."
+        - "revisionDate captured visible revision metadata: VIEWING MOST RECENT REVISION (FROM 2014-09-22)."
+        - "contents length is 119 and contains legal text for Section 1."
+        - "Log evidence shows root discovery found 94 title candidates, selected ABC, skipped ABC and ABC/A1 as navigation pages with child links, then emitted ABC/1 as a leaf."
+        - "Visited checkpoint contains exactly ABC, ABC/A1, and ABC/1; failed checkpoint is empty."
+      oracle_mapping:
+        - "Discovers title links from the root page: pass."
+        - "Crawls first root-discovered title only: pass."
+        - "Uses Playwright-rendered DOM extraction: pass."
+        - "Recursively traverses child pages by depth: pass."
+        - "Emits XML leaf records with sourceURL, revision metadata, level10-level100, and contents: pass."
+        - "Stops via pilot bounds without broad crawling: pass."
+      next_worker: null
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Final audit that the current tranche fully satisfies the original user outcome, with special scrutiny on XML and dynamic level proof."
+    inputs:
+      - "All done task receipts"
+      - "Last verification"
+      - "Current dirty diff"
+      - "Goal oracle"
+    constraints:
+      - "Do not implement."
+      - "Reject completion if required Worker work is still queued or active."
+      - "Reject completion if proof is only planning, discovery, or task selection."
+      - "Reject completion if the broader original pilot crawler outcome still has safe local follow-up slices required by the handoff."
+      - "Reject completion if T004 did not explicitly pass XML, level, traversal, and pilot-scope checklists."
+      - "If rejecting completion, define the next Worker or Judge loop rather than ending with a generic missing-evidence note."
+    expected_output:
+      - "complete | not_complete"
+      - "full_outcome_complete: true | false"
+      - "missing evidence"
+      - "XML/level/traversal/pilot-scope audit summary"
+      - "next Worker/Judge loop if not complete, including objective, allowed_files if Worker, verify commands, and stop_if"
+    receipt:
+      result: done
+      decision: complete
+      full_outcome_complete: true
+      missing_evidence: []
+      summary: "Final audit passes. The current tranche now has implementation evidence, unit verification, live one-title pilot proof, XML artifact inspection, and Judge XML/level/traversal approval mapped back to the original oracle."
+      xml_level_traversal_pilot_scope_audit:
+        - "T003 implemented the approved Playwright-first package in the allowed files and produced a live pilot XML artifact."
+        - "T004 passed XML, level, traversal, and pilot-scope checklists with concrete XML/log/checkpoint evidence."
+        - "No queued or active Worker task remains required for the original one-title pilot outcome."
+        - "Runtime output proves root discovery, first-title selection, child-links-first traversal, leaf-only XML emission, revision capture, level10-level100 tags, non-empty contents, incremental files, logs, and bounded stop behavior."
+      verification:
+        - "python -m unittest discover -s tests: pass"
+        - "$env:PYTHONPATH='src'; python -m nysenate_crawler.pilot_crawler --config config/nysenate_crawler.yaml --max-documents 1 --headless true: pass"
+        - "XML parse/field inspection: pass"
+        - "git diff --check: pass with a CRLF warning for existing .gitignore normalization"
+      dirty_diff_summary:
+        - "Implementation/control changes are present under config/, docs/, requirements.txt, src/, and tests/."
+        - ".gitignore is modified in the worktree but was not edited by this Worker run."
+      next_loop: null
+
+checks:
+  dirty_fingerprint: "git status --short showed M .gitignore plus untracked config/, docs/, requirements.txt, src/, and tests/ after implementation."
+  last_verification:
+    result: pass
+    task: T999
+    commands:
+      - "python -m unittest discover -s tests"
+      - "$env:PYTHONPATH='src'; python -m nysenate_crawler.pilot_crawler --config config/nysenate_crawler.yaml --max-documents 1 --headless true"
+      - "XML parse/field inspection for data/nysenate_consolidated_laws_pilot.xml"
+      - "git diff --check"

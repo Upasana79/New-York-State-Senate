@@ -1,0 +1,57 @@
+browser:
+  headless: false
+  channel: chrome
+  viewport_width: 1920
+  viewport_height: 1080
+  locale: en-US
+  accept_language: en-US,en;q=0.9
+  timezone: America/New_York
+  user_data_dir: data/nysenate_browser_profile
+  user_agents:
+    - Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36
+  args:
+    - --disable-blink-features=AutomationControlled
+
+targets:
+  root_url: https://www.nysenate.gov/legislation/laws/CONSOLIDATED
+  pilot_title_limit: null
+  max_pages: 100000
+  max_documents: 100000
+
+files:
+  output_xml: data/nysenate_consolidated_laws_pilot.xml
+  log_file: logs/nysenate_crawler.log
+  visited_file: data/nysenate_visited_urls.txt
+  failed_file: data/nysenate_failed_urls.txt
+  debug_dir: logs/nysenate_debug
+
+timing:
+  page_load_timeout_ms: 45000
+  selector_timeout_ms: 8000
+  navigation_delay_ms: 1000
+  content_stable_delay_ms: 1200
+  max_retries: 3
+  retry_backoff_seconds: 2
+
+selectors:
+  child_links: .nys-openleg-result-item-link
+  child_label: .nys-openleg-result-item-name
+  child_description: .nys-openleg-result-item-description
+  title_headline: .nys-openleg-result-title-headline
+  title_short: .nys-openleg-result-title-short
+  title_location: .nys-openleg-result-title-location
+  legal_text: .nys-openleg-result-text
+  revision:
+    - .nys-openleg-result-revision
+    - .nys-openleg-result-title-revision
+
+debug:
+  save_html_on_failure: true
+  save_screenshot_on_failure: true
+  save_debug_on_success: false
+
+validation:
+  min_contents_chars: 20
+  require_source_url: true
+  require_at_least_one_level: true
+  reject_navigation_pages: true
