@@ -25,6 +25,7 @@ from nysenate_crawler.pilot_crawler import (  # noqa: E402
     compose_level_title,
     is_relevant_law_url,
     limit_root_title_links,
+    load_capsolver_api_key,
     source_url_key,
     validate_record,
 )
@@ -111,6 +112,32 @@ class ConfigOverrideTests(unittest.TestCase):
         self.assertEqual(overridden.max_documents, 10)
         self.assertFalse(config.headless)
         self.assertEqual(config.max_pages, 25)
+
+
+class CapSolverKeyTests(unittest.TestCase):
+    def test_capsolver_key_prefers_environment_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / "captcha-key.txt"
+            key_file.write_text(" file-key ", encoding="utf-8")
+
+            key = load_capsolver_api_key(key_file, {"CAPSOLVER_API_KEY": " env-key "})
+
+            self.assertEqual(key, "env-key")
+
+    def test_capsolver_key_falls_back_to_local_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / "captcha-key.txt"
+            key_file.write_text("\nfile-key\n", encoding="utf-8")
+
+            key = load_capsolver_api_key(key_file, {})
+
+            self.assertEqual(key, "file-key")
+
+    def test_capsolver_key_is_empty_when_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            key = load_capsolver_api_key(Path(tmp) / "missing.txt", {})
+
+            self.assertEqual(key, "")
 
 
 class URLFilteringTests(unittest.TestCase):

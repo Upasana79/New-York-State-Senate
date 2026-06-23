@@ -48,7 +48,7 @@ python -m playwright install chromium
 This crawls a tiny sample and writes one XML document if the site is reachable:
 
 ```powershell
-python src\nysenate_crawler\pilot_crawler.py --config config\nysenate_crawler.yaml --headless true --max-pages 5 --max-documents 1
+python src\nysenate_crawler\pilot_crawler.py --config config\nysenate_crawler.yaml --max-pages 5 --max-documents 1
 ```
 
 Expected output includes:
@@ -77,6 +77,16 @@ targets:
   max_pages: 100000
   max_documents: 100000
 ```
+
+## Optional CapSolver Key
+
+Keep your CapSolver key out of Git. The crawler loads it from `CAPSOLVER_API_KEY` first, then from the ignored local file `captcha key.txt`.
+
+```powershell
+$env:CAPSOLVER_API_KEY = (Get-Content -Raw "captcha key.txt").Trim()
+```
+
+The current crawler detects human-verification pages and reports whether a CapSolver key is configured.
 
 ## Output
 

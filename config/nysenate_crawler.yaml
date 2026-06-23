@@ -1,5 +1,5 @@
 browser:
-  headless: true
+  headless: false
   channel: chrome
   viewport_width: 1920
   viewport_height: 1080
@@ -55,3 +55,6 @@ validation:
   require_source_url: true
   require_at_least_one_level: true
   reject_navigation_pages: true
+
+captcha:
+  capsolver_key_file: captcha key.txt

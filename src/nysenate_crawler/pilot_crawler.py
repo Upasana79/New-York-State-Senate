@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import random
 import re
 import sys
@@ -17,6 +18,8 @@ from xml.sax.saxutils import escape
 
 LEVEL_KEYS = [f"level{level}" for level in range(10, 101, 10)]
 LOGGER_NAME = "nysenate_crawler"
+CAPSOLVER_ENV_VAR = "CAPSOLVER_API_KEY"
+DEFAULT_CAPSOLVER_KEY_FILE = Path("captcha key.txt")
 
 
 class MissingDependencyError(RuntimeError):
@@ -77,6 +80,8 @@ class CrawlerConfig:
     require_source_url: bool = True
     require_at_least_one_level: bool = True
     reject_navigation_pages: bool = True
+    capsolver_api_key: str = ""
+    capsolver_key_file: Path = DEFAULT_CAPSOLVER_KEY_FILE
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "CrawlerConfig":
@@ -87,6 +92,8 @@ class CrawlerConfig:
         debug = dict(raw.get("debug") or {})
         validation = dict(raw.get("validation") or {})
         selectors = dict(raw.get("selectors") or {})
+        captcha = dict(raw.get("captcha") or {})
+        capsolver_key_file = Path(captcha.get("capsolver_key_file", DEFAULT_CAPSOLVER_KEY_FILE))
 
         return cls(
             root_url=str(targets.get("root_url", "https://www.nysenate.gov/legislation/laws/CONSOLIDATED")),
@@ -122,6 +129,8 @@ class CrawlerConfig:
             require_source_url=as_bool(validation.get("require_source_url", True)),
             require_at_least_one_level=as_bool(validation.get("require_at_least_one_level", True)),
             reject_navigation_pages=as_bool(validation.get("reject_navigation_pages", True)),
+            capsolver_api_key=load_capsolver_api_key(capsolver_key_file),
+            capsolver_key_file=capsolver_key_file,
         )
 
     def with_overrides(
@@ -486,7 +495,9 @@ class NYSenatePilotCrawler:
         challenge_text = f"{title}\n{body}".lower()
         if any(marker in challenge_text for marker in ["captcha", "verify you are human", "cloudflare", "just a moment", "attention required"]):
             await self.save_debug(page, "human-verification")
-            raise HumanVerificationRequired(f"Human verification required at {url}")
+            if self.config.capsolver_api_key:
+                raise HumanVerificationRequired(f"Human verification required at {url}; CapSolver API key is configured.")
+            raise HumanVerificationRequired(f"Human verification required at {url}; no CapSolver API key is configured.")
 
     async def dismiss_obstacles(self, page: Any) -> None:
         selectors = [
@@ -755,6 +766,17 @@ def as_optional_int(value: Any) -> int | None:
 def none_if_blank(value: Any) -> str | None:
     text = "" if value is None else str(value).strip()
     return text or None
+
+
+def load_capsolver_api_key(key_file: Path = DEFAULT_CAPSOLVER_KEY_FILE, env: Mapping[str, str] | None = None) -> str:
+    values = os.environ if env is None else env
+    env_key = clean_text(values.get(CAPSOLVER_ENV_VAR, ""))
+    if env_key:
+        return env_key
+    try:
+        return clean_text(key_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
 
 
 def load_config(path: Path) -> CrawlerConfig:
