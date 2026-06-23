@@ -15,14 +15,17 @@ from nysenate_crawler.pilot_crawler import (  # noqa: E402
     LEVEL_KEYS,
     LinkCandidate,
     LevelOverflowError,
+    NYSenatePilotCrawler,
     XMLDocumentStore,
     XMLDocumentStoreError,
     assign_level,
     build_record,
+    canonical_url,
     classify_page,
     compose_level_title,
     is_relevant_law_url,
     limit_root_title_links,
+    source_url_key,
     validate_record,
 )
 
@@ -33,15 +36,13 @@ class LevelAssignmentTests(unittest.TestCase):
 
         self.assertEqual(title, "ARTICLE 1 Short Title; Policy of State and Purpose of Chapter: Definitions")
 
-    def test_level_title_ignores_location_context(self) -> None:
-        title = compose_level_title(
-            "SECTION 1",
-            "Short title",
-            location_context="Alcoholic Beverage Control (ABC) CHAPTER 3-B, ARTICLE 1",
-        )
+    def test_level_title_uses_only_headline_and_short_title(self) -> None:
+        location_context = "Alcoholic Beverage Control (ABC) CHAPTER 3-B, ARTICLE 1"
+
+        title = compose_level_title("SECTION 1", "Short title")
 
         self.assertEqual(title, "SECTION 1 Short title")
-        self.assertNotIn("Alcoholic Beverage Control", title)
+        self.assertNotIn(location_context, title)
         self.assertNotIn("CHAPTER 3-B", title)
 
     def test_assigns_page_title_by_depth_and_carries_previous_levels(self) -> None:
@@ -94,7 +95,31 @@ class RootTitleLimitTests(unittest.TestCase):
         self.assertEqual(limit_root_title_links(links, config.pilot_title_limit), links[:1])
 
 
+class ConfigOverrideTests(unittest.TestCase):
+    def test_with_overrides_changes_only_explicit_values(self) -> None:
+        config = CrawlerConfig.from_mapping(
+            {
+                "browser": {"headless": False},
+                "targets": {"max_pages": 25, "max_documents": 10},
+            }
+        )
+
+        overridden = config.with_overrides(headless=True, max_pages=5)
+
+        self.assertTrue(overridden.headless)
+        self.assertEqual(overridden.max_pages, 5)
+        self.assertEqual(overridden.max_documents, 10)
+        self.assertFalse(config.headless)
+        self.assertEqual(config.max_pages, 25)
+
+
 class URLFilteringTests(unittest.TestCase):
+    def test_canonical_url_trims_fragments_and_surrounding_whitespace(self) -> None:
+        raw_url = "  https://www.nysenate.gov/legislation/laws/ABC/1/#section  "
+
+        self.assertEqual(canonical_url(raw_url), "https://www.nysenate.gov/legislation/laws/ABC/1")
+        self.assertEqual(source_url_key(raw_url), "https://www.nysenate.gov/legislation/laws/ABC/1")
+
     def test_filters_to_nysenate_law_hierarchy_and_excludes_root(self) -> None:
         root_url = "https://www.nysenate.gov/legislation/laws/CONSOLIDATED"
 
@@ -103,6 +128,26 @@ class URLFilteringTests(unittest.TestCase):
         self.assertFalse(is_relevant_law_url(root_url, root_url))
         self.assertFalse(is_relevant_law_url("https://www.nysenate.gov/legislation/bills/2025/S1", root_url))
         self.assertFalse(is_relevant_law_url("https://example.com/legislation/laws/ABC", root_url))
+
+
+class CheckpointTests(unittest.TestCase):
+    def test_load_checkpoint_reads_nonblank_stripped_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            visited_file = Path(tmp) / "visited.txt"
+            failed_file = Path(tmp) / "failed.txt"
+            visited_file.write_text(" https://www.nysenate.gov/legislation/laws/ABC \n\n", encoding="utf-8")
+            failed_file.write_text("\nhttps://www.nysenate.gov/legislation/laws/ABC/1\n", encoding="utf-8")
+            config = CrawlerConfig(
+                root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+                visited_file=visited_file,
+                failed_file=failed_file,
+            )
+            crawler = NYSenatePilotCrawler(config)
+
+            crawler.load_checkpoint()
+
+            self.assertEqual(crawler.visited_urls, {"https://www.nysenate.gov/legislation/laws/ABC"})
+            self.assertEqual(crawler.failed_urls, {"https://www.nysenate.gov/legislation/laws/ABC/1"})
 
 
 class XMLStoreTests(unittest.TestCase):

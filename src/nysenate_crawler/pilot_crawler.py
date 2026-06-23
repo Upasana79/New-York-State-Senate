@@ -7,7 +7,7 @@ import random
 import re
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -131,14 +131,14 @@ class CrawlerConfig:
         max_pages: int | None = None,
         max_documents: int | None = None,
     ) -> "CrawlerConfig":
-        values = dict(self.__dict__)
+        values: dict[str, Any] = {}
         if headless is not None:
             values["headless"] = headless
         if max_pages is not None:
             values["max_pages"] = max_pages
         if max_documents is not None:
             values["max_documents"] = max_documents
-        return CrawlerConfig(**values)
+        return replace(self, **values)
 
     def selector(self, key: str, default: str) -> str:
         value = self.selectors.get(key, default)
@@ -317,10 +317,8 @@ class NYSenatePilotCrawler:
             path.mkdir(parents=True, exist_ok=True)
 
     def load_checkpoint(self) -> None:
-        if self.config.visited_file.exists():
-            self.visited_urls.update(line.strip() for line in self.config.visited_file.read_text(encoding="utf-8").splitlines() if line.strip())
-        if self.config.failed_file.exists():
-            self.failed_urls.update(line.strip() for line in self.config.failed_file.read_text(encoding="utf-8").splitlines() if line.strip())
+        self.visited_urls.update(read_checkpoint_urls(self.config.visited_file))
+        self.failed_urls.update(read_checkpoint_urls(self.config.failed_file))
 
     def flush_checkpoint(self) -> None:
         write_text_atomic(self.config.visited_file, "\n".join(sorted(self.visited_urls)) + ("\n" if self.visited_urls else ""))
@@ -565,7 +563,7 @@ class NYSenatePilotCrawler:
             self.config.selector("title_location", ".nys-openleg-result-title-location"),
             1000,
         )
-        title = compose_level_title(headline, short_title, location_context=location_context)
+        title = compose_level_title(headline, short_title)
         if title:
             return title
         if location_context:
@@ -635,8 +633,7 @@ def assign_level(carried_levels: Mapping[str, str], depth: int, current_title: s
     return levels
 
 
-def compose_level_title(headline: Any, short_title: Any, *, location_context: Any = None) -> str:
-    _ = location_context
+def compose_level_title(headline: Any, short_title: Any) -> str:
     parts = []
     for part in [headline, short_title]:
         text = clean_text(part)
@@ -645,8 +642,8 @@ def compose_level_title(headline: Any, short_title: Any, *, location_context: An
     return " ".join(parts)
 
 
-def classify_page(child_links: Iterable[LinkCandidate], legal_text: str) -> str:
-    if list(child_links):
+def classify_page(child_links: list[LinkCandidate], legal_text: str) -> str:
+    if child_links:
         return "navigation"
     if clean_text(legal_text):
         return "leaf"
@@ -684,11 +681,15 @@ def build_record(source_url: str, levels: Mapping[str, str], revision: str, cont
 
 def validate_record(record: Mapping[str, str], *, has_children: bool, config: CrawlerConfig) -> list[str]:
     errors: list[str] = []
-    if config.require_source_url and not clean_text(record.get("sourceURL", "")):
+    source_url = clean_text(record.get("sourceURL", ""))
+    contents = clean_text(record.get("contents", ""))
+    has_captured_level = any(clean_text(record.get(key, "")) for key in LEVEL_KEYS)
+
+    if config.require_source_url and not source_url:
         errors.append("missing sourceURL")
-    if config.require_at_least_one_level and not any(clean_text(record.get(key, "")) for key in LEVEL_KEYS):
+    if config.require_at_least_one_level and not has_captured_level:
         errors.append("missing captured level")
-    if len(clean_text(record.get("contents", ""))) < config.min_contents_chars:
+    if len(contents) < config.min_contents_chars:
         errors.append("contents too short")
     if config.reject_navigation_pages and has_children:
         errors.append("navigation page cannot be emitted")
@@ -697,11 +698,8 @@ def validate_record(record: Mapping[str, str], *, has_children: bool, config: Cr
 
 def render_xml_document(record: Mapping[str, str]) -> list[str]:
     lines = ["    <document>"]
-    lines.append(f"      <sourceURL>{xml_escape(record.get('sourceURL', ''))}</sourceURL>")
-    lines.append(f"      <revisionDate>{xml_escape(record.get('revisionDate', ''))}</revisionDate>")
-    for key in LEVEL_KEYS:
+    for key in ("sourceURL", "revisionDate", *LEVEL_KEYS, "contents"):
         lines.append(f"      <{key}>{xml_escape(record.get(key, ''))}</{key}>")
-    lines.append(f"      <contents>{xml_escape(record.get('contents', ''))}</contents>")
     lines.append("    </document>")
     return lines
 
@@ -720,12 +718,12 @@ def is_relevant_law_url(url: str, root_url: str) -> bool:
 
 
 def canonical_url(url: str) -> str:
-    clean, _fragment = urldefrag(str(url))
+    clean, _fragment = urldefrag(clean_text(url))
     return clean.rstrip("/")
 
 
 def source_url_key(url: str) -> str:
-    return canonical_url(url) if clean_text(url) else ""
+    return canonical_url(url)
 
 
 def clean_text(text: Any) -> str:
@@ -776,6 +774,12 @@ def write_text_atomic(path: Path, text: str) -> None:
     temp_path = path.with_name(f"{path.name}.tmp")
     temp_path.write_text(text, encoding="utf-8")
     temp_path.replace(path)
+
+
+def read_checkpoint_urls(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
 def configure_logging(log_file: Path) -> None:
