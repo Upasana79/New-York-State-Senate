@@ -6,11 +6,17 @@ browser:
   locale: en-US
   accept_language: en-US,en;q=0.9
   timezone: America/New_York
-  user_data_dir: data/nysenate_browser_profile
+  session_dir: data/sessions
+  session_target: nysenate
+  rotate_user_agent_per_title: true
+  stealth_enabled: true
   user_agents:
-    - Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36
+    - Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36
+    - Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36
+    - Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
   args:
     - --disable-blink-features=AutomationControlled
+    - --start-maximized
 
 targets:
   root_url: https://www.nysenate.gov/legislation/laws/CONSOLIDATED

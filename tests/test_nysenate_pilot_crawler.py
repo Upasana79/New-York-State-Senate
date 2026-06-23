@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 import tempfile
+import types
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -11,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from nysenate_crawler.pilot_crawler import (  # noqa: E402
+    BrowserIdentity,
     CrawlerConfig,
     LEVEL_KEYS,
     LinkCandidate,
@@ -74,6 +78,104 @@ class PageDecisionTests(unittest.TestCase):
         self.assertEqual(classify_page([], ""), "empty")
 
 
+class DestinationHeaderLevelTests(unittest.TestCase):
+    def test_crawl_levels_come_from_destination_headers_not_navigation_rows(self) -> None:
+        root_url = "https://www.nysenate.gov/legislation/laws/CONSOLIDATED"
+        law_url = "https://www.nysenate.gov/legislation/laws/ABC"
+        article_url = "https://www.nysenate.gov/legislation/laws/ABC/A1"
+        section_url = "https://www.nysenate.gov/legislation/laws/ABC/1"
+        root_link = LinkCandidate(
+            url=law_url,
+            label="ABC",
+            description="ROOT ROW ONLY - Alcoholic Beverage Control",
+        )
+
+        class FakePage:
+            url = ""
+
+            async def wait_for_timeout(self, timeout_ms: int) -> None:
+                return None
+
+        class HeaderOnlyCrawler(NYSenatePilotCrawler):
+            titles = {
+                law_url: "CHAPTER 3-B Destination Law Header",
+                article_url: "ARTICLE 1 Destination Article Header",
+                section_url: "SECTION 1 Destination Section Header",
+            }
+            children = {
+                law_url: [
+                    LinkCandidate(
+                        url=article_url,
+                        label="ARTICLE 1",
+                        description="ROW ONLY - Article title must not be captured",
+                    )
+                ],
+                article_url: [
+                    LinkCandidate(
+                        url=section_url,
+                        label="SECTION 1",
+                        description="ROW ONLY - Section title must not be captured",
+                    )
+                ],
+                section_url: [],
+            }
+
+            async def goto_with_retry(self, page: FakePage, url: str) -> None:
+                page.url = canonical_url(url)
+
+            async def dismiss_obstacles(self, page: FakePage) -> None:
+                return None
+
+            async def extract_current_title(self, page: FakePage) -> str:
+                return self.titles[page.url]
+
+            async def extract_child_links(self, page: FakePage) -> list[LinkCandidate]:
+                return self.children[page.url]
+
+            async def extract_legal_text(self, page: FakePage) -> str:
+                if page.url == section_url:
+                    return "This is destination legal text from the leaf page only."
+                return ""
+
+            async def extract_revision_metadata(self, page: FakePage) -> str:
+                return "Viewing most recent revision (from 2014-09-22)" if page.url == section_url else ""
+
+            async def save_debug(self, page: FakePage, reason: str) -> None:
+                raise AssertionError(f"Unexpected debug save: {reason}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = CrawlerConfig(
+                root_url=root_url,
+                max_pages=10,
+                max_documents=10,
+                output_xml=tmp_path / "pilot.xml",
+                log_file=tmp_path / "crawler.log",
+                visited_file=tmp_path / "visited.txt",
+                failed_file=tmp_path / "failed.txt",
+                debug_dir=tmp_path / "debug",
+                user_data_dir=tmp_path / "profile",
+                min_contents_chars=20,
+            )
+            crawler = HeaderOnlyCrawler(config)
+            crawler.prepare_runtime_paths()
+            crawler.load_checkpoint()
+            crawler.store.initialize()
+
+            asyncio.run(crawler.crawl_page(FakePage(), root_link.url, {}, depth=0))
+
+            document = ET.parse(config.output_xml).getroot().find("./documents/document")
+            self.assertIsNotNone(document)
+            self.assertEqual(document.findtext("level10"), "CHAPTER 3-B Destination Law Header")
+            self.assertEqual(document.findtext("level20"), "ARTICLE 1 Destination Article Header")
+            self.assertEqual(document.findtext("level30"), "SECTION 1 Destination Section Header")
+            self.assertIn("destination legal text", document.findtext("contents") or "")
+
+            xml_text = config.output_xml.read_text(encoding="utf-8")
+            self.assertNotIn("ROOT ROW ONLY", xml_text)
+            self.assertNotIn("ROW ONLY", xml_text)
+
+
 class RootTitleLimitTests(unittest.TestCase):
     def test_null_pilot_title_limit_keeps_all_root_titles(self) -> None:
         links = [
@@ -112,6 +214,203 @@ class ConfigOverrideTests(unittest.TestCase):
         self.assertEqual(overridden.max_documents, 10)
         self.assertFalse(config.headless)
         self.assertEqual(config.max_pages, 25)
+
+    def test_browser_args_include_fingerprint_defaults(self) -> None:
+        config = CrawlerConfig.from_mapping(
+            {
+                "browser": {
+                    "args": ["--disable-blink-features=AutomationControlled"],
+                }
+            }
+        )
+
+        self.assertIn("--disable-blink-features=AutomationControlled", config.browser_args)
+        self.assertIn("--start-maximized", config.browser_args)
+        self.assertTrue(config.stealth_enabled)
+        self.assertTrue(config.rotate_user_agent_per_title)
+        self.assertGreaterEqual(len(config.user_agents), 1)
+
+    def test_session_profile_uses_target_under_sessions_dir(self) -> None:
+        config = CrawlerConfig.from_mapping(
+            {
+                "browser": {
+                    "session_dir": "data/sessions",
+                    "session_target": "NY Senate",
+                }
+            }
+        )
+
+        self.assertEqual(config.user_data_dir, Path("data/sessions/ny_senate_profile"))
+
+    def test_user_data_dir_remains_explicit_profile_override(self) -> None:
+        config = CrawlerConfig.from_mapping(
+            {
+                "browser": {
+                    "session_dir": "data/sessions",
+                    "session_target": "NY Senate",
+                    "user_data_dir": "data/custom_profile",
+                }
+            }
+        )
+
+        self.assertEqual(config.user_data_dir, Path("data/custom_profile"))
+
+
+class BrowserIdentityPoolTests(unittest.TestCase):
+    def test_browser_identity_pool_loops_user_agents_with_separate_profiles_and_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "sessions"
+            config = CrawlerConfig(
+                root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+                session_dir=session_dir,
+                session_target="NY Senate",
+                user_agents=["UA-1", "UA-2"],
+            )
+            crawler = NYSenatePilotCrawler(config)
+
+            first = crawler.next_browser_identity()
+            second = crawler.next_browser_identity()
+            third = crawler.next_browser_identity()
+
+            self.assertEqual(first.user_agent, "UA-1")
+            self.assertEqual(second.user_agent, "UA-2")
+            self.assertEqual(third.user_agent, "UA-1")
+            self.assertEqual(first.user_data_dir, session_dir / "ny_senate_ua01_profile")
+            self.assertEqual(second.user_data_dir, session_dir / "ny_senate_ua02_profile")
+            self.assertTrue(first.user_data_dir.exists())
+            self.assertTrue(second.user_data_dir.exists())
+
+            first_meta = json.loads(first.meta_file.read_text(encoding="utf-8"))
+            second_meta = json.loads(second.meta_file.read_text(encoding="utf-8"))
+            cursor = json.loads((session_dir / "ny_senate_user_agent_cursor.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(first_meta["user_agent"], "UA-1")
+            self.assertEqual(second_meta["user_agent"], "UA-2")
+            self.assertEqual(cursor["next_index"], 1)
+
+
+class BrowserLaunchTests(unittest.TestCase):
+    def test_open_context_uses_real_chrome_visible_persistent_profile(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class FakeChromium:
+            async def launch_persistent_context(self, **kwargs: object) -> str:
+                calls.append(kwargs)
+                return "context"
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "profile"
+            config = CrawlerConfig(
+                root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+                user_data_dir=profile,
+                user_agents=["UA-TEST"],
+                headless=False,
+                channel="chrome",
+                browser_args=["--disable-blink-features=AutomationControlled"],
+            )
+            crawler = NYSenatePilotCrawler(config)
+
+            context = asyncio.run(crawler.open_context(FakePlaywright()))
+
+        self.assertEqual(context, "context")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["user_data_dir"], str(profile))
+        self.assertEqual(calls[0]["channel"], "chrome")
+        self.assertFalse(calls[0]["headless"])
+        self.assertEqual(calls[0]["args"], ["--disable-blink-features=AutomationControlled", "--start-maximized"])
+        self.assertEqual(calls[0]["user_agent"], "UA-TEST")
+
+    def test_open_context_uses_browser_identity_profile_and_user_agent(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class FakeChromium:
+            async def launch_persistent_context(self, **kwargs: object) -> str:
+                calls.append(kwargs)
+                return "context"
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "profile"
+            identity = BrowserIdentity(
+                index=1,
+                user_agent="UA-IDENTITY",
+                user_data_dir=profile,
+                meta_file=Path(tmp) / "meta.json",
+            )
+            config = CrawlerConfig(root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED")
+            crawler = NYSenatePilotCrawler(config)
+
+            context = asyncio.run(crawler.open_context(FakePlaywright(), identity))
+
+        self.assertEqual(context, "context")
+        self.assertEqual(calls[0]["user_data_dir"], str(profile))
+        self.assertEqual(calls[0]["user_agent"], "UA-IDENTITY")
+
+    def test_open_context_does_not_fallback_when_real_chrome_launch_fails(self) -> None:
+        class FakeChromium:
+            calls = 0
+
+            async def launch_persistent_context(self, **kwargs: object) -> str:
+                self.calls += 1
+                raise RuntimeError("chrome missing")
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        config = CrawlerConfig(
+            root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+            headless=False,
+            channel="chrome",
+        )
+        crawler = NYSenatePilotCrawler(config)
+
+        with self.assertRaisesRegex(RuntimeError, "Could not launch real Chrome channel 'chrome'"):
+            asyncio.run(crawler.open_context(FakePlaywright()))
+
+        self.assertEqual(FakePlaywright.chromium.calls, 1)
+
+
+class StealthTests(unittest.TestCase):
+    def test_apply_stealth_can_be_disabled(self) -> None:
+        config = CrawlerConfig(
+            root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+            stealth_enabled=False,
+        )
+        crawler = NYSenatePilotCrawler(config)
+
+        asyncio.run(crawler.apply_stealth(object()))
+
+    def test_apply_stealth_uses_playwright_stealth_when_enabled(self) -> None:
+        applied_pages: list[object] = []
+        original_module = sys.modules.get("playwright_stealth")
+
+        module = types.ModuleType("playwright_stealth")
+
+        class FakeStealth:
+            async def apply_stealth_async(self, page: object) -> None:
+                applied_pages.append(page)
+
+        module.Stealth = FakeStealth
+        sys.modules["playwright_stealth"] = module
+
+        try:
+            config = CrawlerConfig(root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED")
+            crawler = NYSenatePilotCrawler(config)
+            page = object()
+
+            asyncio.run(crawler.apply_stealth(page))
+
+            self.assertEqual(applied_pages, [page])
+        finally:
+            if original_module is None:
+                sys.modules.pop("playwright_stealth", None)
+            else:
+                sys.modules["playwright_stealth"] = original_module
 
 
 class CapSolverKeyTests(unittest.TestCase):

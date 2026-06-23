@@ -31,7 +31,7 @@ Generated output goes to `data/` and `logs/`; those folders are ignored by Git.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python -m playwright install chrome
 ```
 
 On macOS/Linux:
@@ -40,7 +40,7 @@ On macOS/Linux:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python -m playwright install chrome
 ```
 
 ## Smoke Test
@@ -95,6 +95,8 @@ The crawler writes:
 - XML: `data/nysenate_consolidated_laws_pilot.xml`
 - visited checkpoint: `data/nysenate_visited_urls.txt`
 - failed checkpoint: `data/nysenate_failed_urls.txt`
+- persistent Chrome identity profiles: `data/sessions/nysenate_uaNN_profile/`
+- browser identity metadata: `data/sessions/nysenate_uaNN_meta.json`
 - log file: `logs/nysenate_crawler.log`
 - debug files on failures: `logs/nysenate_debug/`
 
@@ -113,6 +115,9 @@ python -m unittest tests.test_nysenate_pilot_crawler
 
 ## Notes
 
-- If Chrome is not installed, the script falls back to Playwright Chromium.
+- The default config launches real visible Chrome with `channel: chrome` and `headless: false`.
+- User agents are looped through a cursor. Each user agent gets its own `data/sessions/<target>_uaNN_profile/` directory so cookies, local storage, and cache stay matched to that browser identity.
+- For multi-title crawls, `rotate_user_agent_per_title: true` opens the next identity between root law titles.
+- The browser uses `--disable-blink-features=AutomationControlled`, `--start-maximized`, and applies `playwright-stealth` to the shared crawl page when `browser.stealth_enabled` is true.
 - If the site asks for human verification, the crawler stops and preserves checkpoints.
 - For GitHub, keep `data/`, `logs/`, browser profiles, and secret files out of commits.

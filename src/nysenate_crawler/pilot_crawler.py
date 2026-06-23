@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
-import random
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -20,6 +20,15 @@ LEVEL_KEYS = [f"level{level}" for level in range(10, 101, 10)]
 LOGGER_NAME = "nysenate_crawler"
 CAPSOLVER_ENV_VAR = "CAPSOLVER_API_KEY"
 DEFAULT_CAPSOLVER_KEY_FILE = Path("captcha key.txt")
+DEFAULT_BROWSER_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--start-maximized",
+]
+DEFAULT_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+]
 
 
 class MissingDependencyError(RuntimeError):
@@ -40,9 +49,23 @@ class XMLDocumentStoreError(RuntimeError):
 
 @dataclass(frozen=True)
 class LinkCandidate:
+    """Navigation row metadata; label/description are not XML level sources."""
+
     url: str
     label: str = ""
     description: str = ""
+
+
+@dataclass(frozen=True)
+class BrowserIdentity:
+    index: int
+    user_agent: str
+    user_data_dir: Path
+    meta_file: Path
+
+    @property
+    def label(self) -> str:
+        return f"ua{self.index + 1:02d}"
 
 
 @dataclass
@@ -63,9 +86,13 @@ class CrawlerConfig:
     locale: str = "en-US"
     accept_language: str = "en-US,en;q=0.9"
     timezone_id: str = "America/New_York"
-    user_data_dir: Path = Path("data/nysenate_browser_profile")
-    user_agents: list[str] = field(default_factory=list)
-    browser_args: list[str] = field(default_factory=list)
+    session_dir: Path = Path("data/sessions")
+    session_target: str = "nysenate"
+    user_data_dir: Path = Path("data/sessions/nysenate_profile")
+    user_agents: list[str] = field(default_factory=lambda: list(DEFAULT_USER_AGENTS))
+    rotate_user_agent_per_title: bool = True
+    browser_args: list[str] = field(default_factory=lambda: list(DEFAULT_BROWSER_ARGS))
+    stealth_enabled: bool = True
     page_load_timeout_ms: int = 45000
     selector_timeout_ms: int = 8000
     navigation_delay_ms: int = 1000
@@ -82,6 +109,11 @@ class CrawlerConfig:
     reject_navigation_pages: bool = True
     capsolver_api_key: str = ""
     capsolver_key_file: Path = DEFAULT_CAPSOLVER_KEY_FILE
+
+    def __post_init__(self) -> None:
+        self.session_target = safe_session_target(self.session_target)
+        self.user_agents = user_agents_with_defaults(self.user_agents)
+        self.browser_args = browser_args_with_defaults(self.browser_args)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "CrawlerConfig":
@@ -112,9 +144,13 @@ class CrawlerConfig:
             locale=str(browser.get("locale", "en-US")),
             accept_language=str(browser.get("accept_language", browser.get("Accept-Language", "en-US,en;q=0.9"))),
             timezone_id=str(browser.get("timezone", "America/New_York")),
-            user_data_dir=Path(browser.get("user_data_dir", "data/nysenate_browser_profile")),
-            user_agents=list(browser.get("user_agents") or []),
-            browser_args=list(browser.get("args") or []),
+            session_dir=Path(browser.get("session_dir", "data/sessions")),
+            session_target=safe_session_target(browser.get("session_target", "nysenate")),
+            user_data_dir=session_profile_dir(browser),
+            user_agents=user_agents_with_defaults(browser.get("user_agents") or []),
+            rotate_user_agent_per_title=as_bool(browser.get("rotate_user_agent_per_title", True)),
+            browser_args=browser_args_with_defaults(browser.get("args") or []),
+            stealth_enabled=as_bool(browser.get("stealth_enabled", True)),
             page_load_timeout_ms=int(timing.get("page_load_timeout_ms", 45000)),
             selector_timeout_ms=int(timing.get("selector_timeout_ms", 8000)),
             navigation_delay_ms=int(timing.get("navigation_delay_ms", 1000)),
@@ -278,9 +314,11 @@ class NYSenatePilotCrawler:
             self.store.initialize()
 
             async with async_playwright() as playwright:
-                context = await self.open_context(playwright)
+                context = None
                 try:
+                    context = await self.open_context(playwright, self.next_browser_identity())
                     page = context.pages[0] if context.pages else await context.new_page()
+                    await self.apply_stealth(page)
                     root_links = await self.discover_root_title_links(page)
                     if not root_links:
                         await self.save_debug(page, "root-no-title-links")
@@ -294,14 +332,20 @@ class NYSenatePilotCrawler:
                         len(root_links),
                     )
 
-                    for title_link in title_links:
+                    for index, title_link in enumerate(title_links):
                         if self.safety_limit_reached():
                             self.logger.info("Stopping crawl before next title because a safety limit was reached.")
                             break
+                        if index > 0 and self.config.rotate_user_agent_per_title:
+                            await context.close()
+                            context = await self.open_context(playwright, self.next_browser_identity())
+                            page = context.pages[0] if context.pages else await context.new_page()
+                            await self.apply_stealth(page)
                         self.logger.info("Selected crawl title: %s (%s)", title_link.label or title_link.url, title_link.url)
                         await self.crawl_page(page, title_link.url, {}, depth=0)
                 finally:
-                    await context.close()
+                    if context is not None:
+                        await context.close()
         except KeyboardInterrupt:
             self.logger.warning("Crawl interrupted by user; XML and checkpoints have been preserved.")
             raise
@@ -321,6 +365,7 @@ class NYSenatePilotCrawler:
             self.config.visited_file.parent,
             self.config.failed_file.parent,
             self.config.debug_dir,
+            self.config.session_dir,
             self.config.user_data_dir,
         ]:
             path.mkdir(parents=True, exist_ok=True)
@@ -333,7 +378,58 @@ class NYSenatePilotCrawler:
         write_text_atomic(self.config.visited_file, "\n".join(sorted(self.visited_urls)) + ("\n" if self.visited_urls else ""))
         write_text_atomic(self.config.failed_file, "\n".join(sorted(self.failed_urls)) + ("\n" if self.failed_urls else ""))
 
-    async def open_context(self, playwright: Any) -> Any:
+    def next_browser_identity(self) -> BrowserIdentity:
+        index = self.next_user_agent_index()
+        user_agent = self.config.user_agents[index]
+        profile_name = f"{self.config.session_target}_ua{index + 1:02d}_profile"
+        meta_name = f"{self.config.session_target}_ua{index + 1:02d}_meta.json"
+        identity = BrowserIdentity(
+            index=index,
+            user_agent=user_agent,
+            user_data_dir=self.config.session_dir / profile_name,
+            meta_file=self.config.session_dir / meta_name,
+        )
+        identity.user_data_dir.mkdir(parents=True, exist_ok=True)
+        self.write_browser_identity_meta(identity)
+        self.write_user_agent_cursor((index + 1) % len(self.config.user_agents))
+        self.logger.info("Selected browser identity %s with profile=%s", identity.label, identity.user_data_dir)
+        return identity
+
+    def next_user_agent_index(self) -> int:
+        cursor = read_json_mapping(self.user_agent_cursor_file())
+        raw_index = cursor.get("next_index", 0)
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            index = 0
+        return index % len(self.config.user_agents)
+
+    def write_user_agent_cursor(self, next_index: int) -> None:
+        payload = {
+            "session_target": self.config.session_target,
+            "next_index": next_index,
+            "pool_size": len(self.config.user_agents),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        write_json_atomic(self.user_agent_cursor_file(), payload)
+
+    def write_browser_identity_meta(self, identity: BrowserIdentity) -> None:
+        payload = {
+            "session_target": self.config.session_target,
+            "identity": identity.label,
+            "identity_index": identity.index,
+            "user_agent": identity.user_agent,
+            "profile_dir": str(identity.user_data_dir),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        write_json_atomic(identity.meta_file, payload)
+
+    def user_agent_cursor_file(self) -> Path:
+        return self.config.session_dir / f"{self.config.session_target}_user_agent_cursor.json"
+
+    async def open_context(self, playwright: Any, identity: BrowserIdentity | None = None) -> Any:
+        user_data_dir = identity.user_data_dir if identity else self.config.user_data_dir
+        user_agent = identity.user_agent if identity else self.config.user_agents[0]
         kwargs: dict[str, Any] = {
             "headless": self.config.headless,
             "viewport": {"width": self.config.viewport_width, "height": self.config.viewport_height},
@@ -341,20 +437,38 @@ class NYSenatePilotCrawler:
             "timezone_id": self.config.timezone_id,
             "extra_http_headers": {"Accept-Language": self.config.accept_language},
             "args": self.config.browser_args,
+            "user_agent": user_agent,
         }
-        if self.config.user_agents:
-            kwargs["user_agent"] = random.choice(self.config.user_agents)
         if self.config.channel:
             kwargs["channel"] = self.config.channel
 
         try:
-            return await playwright.chromium.launch_persistent_context(str(self.config.user_data_dir), **kwargs)
-        except Exception:
-            if "channel" not in kwargs:
+            self.logger.info(
+                "Launching Playwright persistent browser context: channel=%s headless=%s profile=%s user_agent=%s",
+                self.config.channel or "default",
+                self.config.headless,
+                user_data_dir,
+                user_agent,
+            )
+            return await playwright.chromium.launch_persistent_context(user_data_dir=str(user_data_dir), **kwargs)
+        except Exception as exc:
+            if not self.config.channel:
                 raise
-            channel = kwargs.pop("channel")
-            self.logger.warning("Could not launch Chromium channel %s; retrying default Playwright Chromium.", channel)
-            return await playwright.chromium.launch_persistent_context(str(self.config.user_data_dir), **kwargs)
+            raise RuntimeError(
+                f"Could not launch real Chrome channel {self.config.channel!r}. "
+                "Install Chrome with: python -m playwright install chrome"
+            ) from exc
+
+    async def apply_stealth(self, page: Any) -> None:
+        if not self.config.stealth_enabled:
+            return
+        try:
+            from playwright_stealth import Stealth
+        except ImportError as exc:
+            raise MissingDependencyError("playwright-stealth is required when browser.stealth_enabled is true. Run: python -m pip install -r requirements.txt") from exc
+
+        await Stealth().apply_stealth_async(page)
+        self.logger.info("Applied playwright-stealth to the shared NY Senate crawl page.")
 
     async def discover_root_title_links(self, page: Any) -> list[LinkCandidate]:
         await self.goto_with_retry(page, self.config.root_url)
@@ -397,6 +511,8 @@ class NYSenatePilotCrawler:
         await self.dismiss_obstacles(page)
         await page.wait_for_timeout(self.config.content_stable_delay_ms)
 
+        # Levels come from the destination page after navigation. Child-row
+        # label/description text is navigation metadata, not XML level text.
         title = await self.extract_current_title(page)
         try:
             levels = assign_level(carried_levels, depth, title)
@@ -768,6 +884,33 @@ def none_if_blank(value: Any) -> str | None:
     return text or None
 
 
+def safe_session_target(value: Any) -> str:
+    target = clean_text(value or "nysenate").lower()
+    return re.sub(r"[^a-z0-9._-]+", "_", target).strip("._-") or "nysenate"
+
+
+def user_agents_with_defaults(values: Iterable[Any]) -> list[str]:
+    agents = [clean_text(value) for value in values if clean_text(value)]
+    return agents or list(DEFAULT_USER_AGENTS)
+
+
+def session_profile_dir(browser: Mapping[str, Any]) -> Path:
+    if browser.get("user_data_dir"):
+        return Path(browser["user_data_dir"])
+
+    session_dir = Path(browser.get("session_dir", "data/sessions"))
+    target = safe_session_target(browser.get("session_target", "nysenate"))
+    return session_dir / f"{target}_profile"
+
+
+def browser_args_with_defaults(values: Iterable[Any]) -> list[str]:
+    args = [str(value) for value in values if value]
+    for default_arg in DEFAULT_BROWSER_ARGS:
+        if default_arg not in args:
+            args.append(default_arg)
+    return args
+
+
 def load_capsolver_api_key(key_file: Path = DEFAULT_CAPSOLVER_KEY_FILE, env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     env_key = clean_text(values.get(CAPSOLVER_ENV_VAR, ""))
@@ -796,6 +939,18 @@ def write_text_atomic(path: Path, text: str) -> None:
     temp_path = path.with_name(f"{path.name}.tmp")
     temp_path.write_text(text, encoding="utf-8")
     temp_path.replace(path)
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def read_json_mapping(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def read_checkpoint_urls(path: Path) -> set[str]:

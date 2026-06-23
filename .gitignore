@@ -33,6 +33,7 @@ test-results/
 data/
 logs/
 tmp/
+evidence/
 *.log
 *.csv
 *.sqlite
