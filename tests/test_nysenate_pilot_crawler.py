@@ -15,7 +15,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from nysenate_crawler.pilot_crawler import (  # noqa: E402
     BrowserIdentity,
+    CapSolverClient,
     CrawlerConfig,
+    HumanVerificationRequired,
     LEVEL_KEYS,
     LinkCandidate,
     LevelOverflowError,
@@ -25,14 +27,79 @@ from nysenate_crawler.pilot_crawler import (  # noqa: E402
     assign_level,
     build_record,
     canonical_url,
+    capsolver_cookie_payloads,
+    challenge_markers,
     classify_page,
     compose_level_title,
     is_relevant_law_url,
     limit_root_title_links,
     load_capsolver_api_key,
+    playwright_proxy_from_capsolver_proxy,
     source_url_key,
     validate_record,
 )
+
+
+class FakeResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+
+class FakeBodyLocator:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    async def inner_text(self, timeout: int = 0) -> str:
+        return self.text
+
+
+class FakeCookieContext:
+    def __init__(self) -> None:
+        self.cookies: list[dict[str, object]] = []
+
+    async def add_cookies(self, cookies: list[dict[str, object]]) -> None:
+        self.cookies.extend(cookies)
+
+
+class FakeNavigationPage:
+    def __init__(self, statuses: list[int], titles: list[str] | None = None, bodies: list[str] | None = None) -> None:
+        self.responses = [FakeResponse(status) for status in statuses]
+        self.titles = titles or [""] * len(statuses)
+        self.bodies = bodies or [""] * len(statuses)
+        self.goto_calls: list[str] = []
+        self.waits: list[int] = []
+        self.index = -1
+        self.url = ""
+        self.context = FakeCookieContext()
+
+    async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> FakeResponse:
+        self.goto_calls.append(url)
+        self.index += 1
+        self.url = url
+        return self.responses[self.index]
+
+    async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+        return None
+
+    async def wait_for_timeout(self, timeout_ms: int) -> None:
+        self.waits.append(timeout_ms)
+
+    async def title(self) -> str:
+        return self.titles[min(max(self.index, 0), len(self.titles) - 1)]
+
+    def locator(self, selector: str) -> FakeBodyLocator:
+        return FakeBodyLocator(self.bodies[min(max(self.index, 0), len(self.bodies) - 1)])
+
+    async def content(self) -> str:
+        return "<html></html>"
+
+    async def evaluate(self, script: str, *args: object) -> object:
+        if "navigator.userAgent" in script:
+            return "Fake Chrome"
+        return {}
+
+    async def screenshot(self, path: str, full_page: bool = False, timeout: int = 0) -> None:
+        return None
 
 
 class LevelAssignmentTests(unittest.TestCase):
@@ -78,70 +145,337 @@ class PageDecisionTests(unittest.TestCase):
         self.assertEqual(classify_page([], ""), "empty")
 
 
-class DestinationHeaderLevelTests(unittest.TestCase):
-    def test_crawl_levels_come_from_destination_headers_not_navigation_rows(self) -> None:
-        root_url = "https://www.nysenate.gov/legislation/laws/CONSOLIDATED"
-        law_url = "https://www.nysenate.gov/legislation/laws/ABC"
-        article_url = "https://www.nysenate.gov/legislation/laws/ABC/A1"
-        section_url = "https://www.nysenate.gov/legislation/laws/ABC/1"
-        root_link = LinkCandidate(
-            url=law_url,
-            label="ABC",
-            description="ROOT ROW ONLY - Alcoholic Beverage Control",
+class NavigationGuardTests(unittest.TestCase):
+    def test_challenge_markers_detect_status_and_text_fingerprints(self) -> None:
+        markers = challenge_markers(503, "Verification required", "Just a moment")
+
+        self.assertIn("HTTP 503", markers)
+        self.assertIn("just a moment", markers)
+        self.assertIn("verification", markers)
+
+    def test_challenge_markers_do_not_treat_generic_body_verification_as_block(self) -> None:
+        markers = challenge_markers(None, "New York Senate Laws", "Verification of a filed document is required.")
+
+        self.assertEqual(markers, [])
+
+    def test_goto_retries_429_with_rate_limit_backoff(self) -> None:
+        config = CrawlerConfig(
+            root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+            max_retries=2,
+            pre_navigation_delay_min_ms=0,
+            pre_navigation_delay_max_ms=0,
+            navigation_delay_ms=0,
+            selector_timeout_ms=0,
+            rate_limit_backoff_base_seconds=15,
+        )
+        crawler = NYSenatePilotCrawler(config)
+        page = FakeNavigationPage(
+            [429, 200],
+            titles=["Too Many Requests", "New York Senate"],
+            bodies=["slow down", "laws"],
         )
 
-        class FakePage:
-            url = ""
+        asyncio.run(crawler.goto_with_retry(page, "https://www.nysenate.gov/legislation/laws/ABC"))
+
+        self.assertEqual(page.goto_calls, ["https://www.nysenate.gov/legislation/laws/ABC"] * 2)
+        self.assertIn(15000, page.waits)
+        self.assertNotIn("https://www.nysenate.gov/legislation/laws/ABC", crawler.failed_urls)
+
+    def test_goto_preserves_human_verification_error_after_debug_capture(self) -> None:
+        class DebugCrawler(NYSenatePilotCrawler):
+            def __init__(self, config: CrawlerConfig) -> None:
+                super().__init__(config)
+                self.debug_reasons: list[str] = []
+
+            async def save_debug(self, page: object, reason: str) -> None:
+                self.debug_reasons.append(reason)
+
+        url = "https://www.nysenate.gov/legislation/laws/ABC"
+        config = CrawlerConfig(
+            root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+            max_retries=1,
+            pre_navigation_delay_min_ms=0,
+            pre_navigation_delay_max_ms=0,
+            challenge_interaction_enabled=False,
+        )
+        crawler = DebugCrawler(config)
+        page = FakeNavigationPage([503], titles=["Just a moment"], bodies=["Checking if you are human"])
+
+        with self.assertRaises(HumanVerificationRequired):
+            asyncio.run(crawler.goto_with_retry(page, url))
+
+        self.assertEqual(crawler.debug_reasons, ["human-verification", "navigation-failed"])
+        self.assertIn(url, crawler.failed_urls)
+
+    def test_goto_solves_cloudflare_challenge_with_capsolver_cookie(self) -> None:
+        class SolvingCrawler(NYSenatePilotCrawler):
+            def __init__(self, config: CrawlerConfig) -> None:
+                super().__init__(config)
+                self.tasks: list[dict[str, object]] = []
+                self.debug_reasons: list[str] = []
+
+            async def save_debug(self, page: object, reason: str) -> None:
+                self.debug_reasons.append(reason)
+
+            async def solve_capsolver_task(self, task: dict[str, object]) -> dict[str, object]:
+                self.tasks.append(task)
+                return {"cookies": {"cf_clearance": "clearance-token"}}
+
+        url = "https://www.nysenate.gov/legislation/laws/ABC"
+        config = CrawlerConfig(
+            root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+            max_retries=1,
+            pre_navigation_delay_min_ms=0,
+            pre_navigation_delay_max_ms=0,
+            navigation_delay_ms=0,
+            selector_timeout_ms=0,
+            capsolver_api_key="api-key",
+            capsolver_proxy="http:127.0.0.1:8080:user:pass",
+            challenge_interaction_enabled=False,
+        )
+        crawler = SolvingCrawler(config)
+        page = FakeNavigationPage(
+            [503, 200],
+            titles=["Just a moment", "New York Senate Laws"],
+            bodies=["Cloudflare verification required", "Alcoholic Beverage Control"],
+        )
+
+        asyncio.run(crawler.goto_with_retry(page, url))
+
+        self.assertEqual(page.goto_calls, [url, url])
+        self.assertEqual(crawler.tasks[0]["type"], "AntiCloudflareTask")
+        self.assertEqual(crawler.tasks[0]["proxy"], "http:127.0.0.1:8080:user:pass")
+        self.assertEqual(crawler.tasks[0]["userAgent"], "Fake Chrome")
+        self.assertEqual(page.context.cookies, [{"name": "cf_clearance", "value": "clearance-token", "url": "https://www.nysenate.gov/"}])
+        self.assertEqual(crawler.debug_reasons, ["human-verification"])
+        self.assertNotIn(url, crawler.failed_urls)
+
+    def test_capsolver_preferred_runs_before_browser_interaction(self) -> None:
+        class CapSolverFirstCrawler(NYSenatePilotCrawler):
+            def __init__(self, config: CrawlerConfig) -> None:
+                super().__init__(config)
+                self.order: list[str] = []
+
+            async def save_debug(self, page: object, reason: str) -> None:
+                return None
+
+            async def try_light_challenge_interaction(self, page: object, url: str) -> bool:
+                self.order.append("light")
+                return False
+
+            async def solve_capsolver_task(self, task: dict[str, object]) -> dict[str, object]:
+                self.order.append("capsolver")
+                return {"cookies": {"cf_clearance": "clearance-token"}}
+
+        url = "https://www.nysenate.gov/legislation/laws/ABC"
+        config = CrawlerConfig(
+            root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+            max_retries=1,
+            pre_navigation_delay_min_ms=0,
+            pre_navigation_delay_max_ms=0,
+            navigation_delay_ms=0,
+            selector_timeout_ms=0,
+            capsolver_api_key="api-key",
+            capsolver_proxy="http:127.0.0.1:8080:user:pass",
+            capsolver_preferred=True,
+            challenge_interaction_enabled=True,
+        )
+        crawler = CapSolverFirstCrawler(config)
+        page = FakeNavigationPage(
+            [503, 200],
+            titles=["Just a moment", "New York Senate Laws"],
+            bodies=["Cloudflare verification required", "Alcoholic Beverage Control"],
+        )
+
+        asyncio.run(crawler.goto_with_retry(page, url))
+
+        self.assertEqual(crawler.order, ["capsolver"])
+
+    def test_capsolver_cookie_payloads_use_token_as_cf_clearance_fallback(self) -> None:
+        payloads = capsolver_cookie_payloads({"token": "clearance-token"}, "https://www.nysenate.gov/legislation/laws/ABC")
+
+        self.assertEqual(payloads, [{"name": "cf_clearance", "value": "clearance-token", "url": "https://www.nysenate.gov/"}])
+
+    def test_playwright_proxy_from_capsolver_proxy_parses_scheme_credentials(self) -> None:
+        proxy = playwright_proxy_from_capsolver_proxy("https:proxy.example.com:8443:user:pa:ss")
+
+        self.assertEqual(
+            proxy,
+            {"server": "https://proxy.example.com:8443", "username": "user", "password": "pa:ss"},
+        )
+
+    def test_capsolver_client_polls_until_solution_is_ready(self) -> None:
+        class FakeCapSolverClient(CapSolverClient):
+            def __init__(self) -> None:
+                super().__init__("api-key")
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def post_json(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+                self.calls.append((path, payload))
+                if path == "createTask":
+                    return {"errorId": 0, "taskId": "task-1"}
+                if len(self.calls) == 2:
+                    return {"errorId": 0, "status": "processing"}
+                return {"errorId": 0, "status": "ready", "solution": {"token": "solved"}}
+
+        client = FakeCapSolverClient()
+
+        solution = asyncio.run(client.solve_task({"type": "AntiTurnstileTaskProxyLess"}, poll_interval_seconds=0.01, timeout_seconds=1))
+
+        self.assertEqual(solution, {"token": "solved"})
+        self.assertEqual([path for path, _payload in client.calls], ["createTask", "getTaskResult", "getTaskResult"])
+
+    def test_capsolver_client_get_balance_calls_balance_endpoint(self) -> None:
+        class FakeCapSolverClient(CapSolverClient):
+            def __init__(self) -> None:
+                super().__init__("api-key")
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def post_json(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+                self.calls.append((path, payload))
+                return {"errorId": 0, "balance": 12.5, "packages": []}
+
+        client = FakeCapSolverClient()
+
+        balance = asyncio.run(client.get_balance())
+
+        self.assertEqual(balance["balance"], 12.5)
+        self.assertEqual(client.calls, [("getBalance", {"clientKey": "api-key"})])
+
+
+class DestinationHeaderLevelTests(unittest.TestCase):
+    def test_navigation_follows_discovered_links_and_uses_destination_headers(self) -> None:
+        base_url = "https://www.nysenate.gov/legislation/laws"
+        root_url = f"{base_url}/CONSOLIDATED"
+        law_url = f"{base_url}/ABC"
+        article_url = f"{base_url}/ABC/A1"
+        section_url = f"{base_url}/ABC/1"
+
+        title_headline = ".nys-openleg-result-title-headline"
+        legal_text = ".nys-openleg-result-text"
+        child_links = ".nys-openleg-result-item-link"
+
+        pages = {
+            root_url: {
+                "body": "Consolidated laws index",
+                "texts": {},
+                "links": [
+                    {
+                        "href": "/legislation/laws/ABC",
+                        "label": "ABC",
+                        "description": "ROOT ROW ONLY - Alcoholic Beverage Control",
+                    },
+                    {
+                        "href": "/legislation/laws/CONSOLIDATED",
+                        "label": "Root",
+                        "description": "Should be filtered because it is the configured root URL.",
+                    },
+                    {
+                        "href": "https://example.com/legislation/laws/ABC",
+                        "label": "External",
+                        "description": "Should be filtered because it is outside the NY Senate host.",
+                    },
+                ],
+            },
+            law_url: {
+                "body": "Law page",
+                "texts": {title_headline: "CHAPTER 3-B Destination Law Header"},
+                "links": [
+                    {
+                        "href": "/legislation/laws/ABC/A1#article",
+                        "label": "ARTICLE 1",
+                        "description": "ROW ONLY - Article title must not be captured",
+                    }
+                ],
+            },
+            article_url: {
+                "body": "Article page",
+                "texts": {title_headline: "ARTICLE 1 Destination Article Header"},
+                "links": [
+                    {
+                        "href": "1",
+                        "label": "SECTION 1",
+                        "description": "ROW ONLY - Section title must not be captured",
+                    }
+                ],
+            },
+            section_url: {
+                "body": "Viewing most recent revision (from 2014-09-22)",
+                "texts": {
+                    title_headline: "SECTION 1 Destination Section Header",
+                    legal_text: "This is destination legal text from the leaf page only.",
+                },
+                "links": [],
+            },
+        }
+
+        class LocatorBackedFakePage:
+            def __init__(self, page_data: dict[str, dict[str, object]]) -> None:
+                self.page_data = page_data
+                self.url = ""
+                self.goto_calls: list[str] = []
+                self.waits: list[int] = []
+
+            def current_page(self) -> dict[str, object]:
+                return self.page_data[self.url]
+
+            async def goto(self, url: str, wait_until: str = "", timeout: int = 0) -> FakeResponse:
+                self.url = canonical_url(url)
+                if self.url not in self.page_data:
+                    raise AssertionError(f"Unexpected navigation to {self.url}")
+                self.goto_calls.append(self.url)
+                return FakeResponse(200)
+
+            async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+                return None
 
             async def wait_for_timeout(self, timeout_ms: int) -> None:
+                self.waits.append(timeout_ms)
+
+            async def title(self) -> str:
+                return "New York Senate"
+
+            def locator(self, selector: str) -> "LocatorBackedFakeLocator":
+                return LocatorBackedFakeLocator(self, selector)
+
+            async def content(self) -> str:
+                return "<html></html>"
+
+            async def screenshot(self, path: str, full_page: bool = False, timeout: int = 0) -> None:
                 return None
 
-        class HeaderOnlyCrawler(NYSenatePilotCrawler):
-            titles = {
-                law_url: "CHAPTER 3-B Destination Law Header",
-                article_url: "ARTICLE 1 Destination Article Header",
-                section_url: "SECTION 1 Destination Section Header",
-            }
-            children = {
-                law_url: [
-                    LinkCandidate(
-                        url=article_url,
-                        label="ARTICLE 1",
-                        description="ROW ONLY - Article title must not be captured",
-                    )
-                ],
-                article_url: [
-                    LinkCandidate(
-                        url=section_url,
-                        label="SECTION 1",
-                        description="ROW ONLY - Section title must not be captured",
-                    )
-                ],
-                section_url: [],
-            }
+        class LocatorBackedFakeLocator:
+            def __init__(self, page: LocatorBackedFakePage, selector: str) -> None:
+                self.page = page
+                self.selector = selector
 
-            async def goto_with_retry(self, page: FakePage, url: str) -> None:
-                page.url = canonical_url(url)
+            @property
+            def first(self) -> "LocatorBackedFakeLocator":
+                return self
 
-            async def dismiss_obstacles(self, page: FakePage) -> None:
+            def text(self) -> str:
+                if self.selector == "body":
+                    return str(self.page.current_page().get("body", ""))
+                texts = self.page.current_page().get("texts", {})
+                return str(texts.get(self.selector, "")) if isinstance(texts, dict) else ""
+
+            async def count(self) -> int:
+                return 1 if self.text() else 0
+
+            async def inner_text(self, timeout: int = 0) -> str:
+                return self.text()
+
+            async def evaluate_all(self, script: str, arg: object = None) -> list[dict[str, str]]:
+                if self.selector != child_links:
+                    return []
+                links = self.page.current_page().get("links", [])
+                return list(links) if isinstance(links, list) else []
+
+            async def is_visible(self, timeout: int = 0) -> bool:
+                return False
+
+            async def click(self) -> None:
                 return None
-
-            async def extract_current_title(self, page: FakePage) -> str:
-                return self.titles[page.url]
-
-            async def extract_child_links(self, page: FakePage) -> list[LinkCandidate]:
-                return self.children[page.url]
-
-            async def extract_legal_text(self, page: FakePage) -> str:
-                if page.url == section_url:
-                    return "This is destination legal text from the leaf page only."
-                return ""
-
-            async def extract_revision_metadata(self, page: FakePage) -> str:
-                return "Viewing most recent revision (from 2014-09-22)" if page.url == section_url else ""
-
-            async def save_debug(self, page: FakePage, reason: str) -> None:
-                raise AssertionError(f"Unexpected debug save: {reason}")
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -157,19 +491,29 @@ class DestinationHeaderLevelTests(unittest.TestCase):
                 user_data_dir=tmp_path / "profile",
                 min_contents_chars=20,
             )
-            crawler = HeaderOnlyCrawler(config)
+            crawler = NYSenatePilotCrawler(config)
             crawler.prepare_runtime_paths()
             crawler.load_checkpoint()
             crawler.store.initialize()
 
-            asyncio.run(crawler.crawl_page(FakePage(), root_link.url, {}, depth=0))
+            page = LocatorBackedFakePage(pages)
+            root_links = asyncio.run(crawler.discover_root_title_links(page))
+
+            self.assertEqual(
+                root_links,
+                [LinkCandidate(url=law_url, label="ABC", description="ROOT ROW ONLY - Alcoholic Beverage Control")],
+            )
+
+            asyncio.run(crawler.crawl_page(page, root_links[0].url, {}, depth=0))
 
             document = ET.parse(config.output_xml).getroot().find("./documents/document")
             self.assertIsNotNone(document)
             self.assertEqual(document.findtext("level10"), "CHAPTER 3-B Destination Law Header")
             self.assertEqual(document.findtext("level20"), "ARTICLE 1 Destination Article Header")
             self.assertEqual(document.findtext("level30"), "SECTION 1 Destination Section Header")
+            self.assertEqual(document.findtext("sourceURL"), section_url)
             self.assertIn("destination legal text", document.findtext("contents") or "")
+            self.assertEqual(page.goto_calls, [root_url, law_url, article_url, section_url])
 
             xml_text = config.output_xml.read_text(encoding="utf-8")
             self.assertNotIn("ROOT ROW ONLY", xml_text)
@@ -255,6 +599,51 @@ class ConfigOverrideTests(unittest.TestCase):
 
         self.assertEqual(config.user_data_dir, Path("data/custom_profile"))
 
+    def test_risk_reduction_timing_and_challenge_config_is_loaded(self) -> None:
+        config = CrawlerConfig.from_mapping(
+            {
+                "timing": {
+                    "pre_navigation_delay_min_ms": 5,
+                    "pre_navigation_delay_max_ms": 25,
+                    "rate_limit_backoff_base_seconds": 7,
+                    "timeout_backoff_base_seconds": 11,
+                },
+                "captcha": {
+                    "capsolver_api_base": "https://capsolver.example",
+                    "capsolver_proxy": "http:127.0.0.1:8080:user:pass",
+                    "capsolver_poll_interval_seconds": 3,
+                    "capsolver_timeout_seconds": 60,
+                    "capsolver_request_timeout_seconds": 12,
+                    "capsolver_preferred": False,
+                    "capsolver_log_balance_on_start": False,
+                    "capsolver_use_proxy_for_browser": False,
+                    "challenge_interaction_enabled": False,
+                    "challenge_mouse_moves": 2,
+                    "challenge_iframe_timeout_ms": 3000,
+                    "challenge_settle_ms": 4000,
+                    "challenge_cooldown_seconds": 9,
+                },
+            }
+        )
+
+        self.assertEqual(config.pre_navigation_delay_min_ms, 5)
+        self.assertEqual(config.pre_navigation_delay_max_ms, 25)
+        self.assertEqual(config.rate_limit_backoff_base_seconds, 7)
+        self.assertEqual(config.timeout_backoff_base_seconds, 11)
+        self.assertEqual(config.capsolver_api_base, "https://capsolver.example")
+        self.assertEqual(config.capsolver_proxy, "http:127.0.0.1:8080:user:pass")
+        self.assertEqual(config.capsolver_poll_interval_seconds, 3)
+        self.assertEqual(config.capsolver_timeout_seconds, 60)
+        self.assertEqual(config.capsolver_request_timeout_seconds, 12)
+        self.assertFalse(config.capsolver_preferred)
+        self.assertFalse(config.capsolver_log_balance_on_start)
+        self.assertFalse(config.capsolver_use_proxy_for_browser)
+        self.assertFalse(config.challenge_interaction_enabled)
+        self.assertEqual(config.challenge_mouse_moves, 2)
+        self.assertEqual(config.challenge_iframe_timeout_ms, 3000)
+        self.assertEqual(config.challenge_settle_ms, 4000)
+        self.assertEqual(config.challenge_cooldown_seconds, 9)
+
 
 class BrowserIdentityPoolTests(unittest.TestCase):
     def test_browser_identity_pool_loops_user_agents_with_separate_profiles_and_meta(self) -> None:
@@ -322,6 +711,31 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertFalse(calls[0]["headless"])
         self.assertEqual(calls[0]["args"], ["--disable-blink-features=AutomationControlled", "--start-maximized"])
         self.assertEqual(calls[0]["user_agent"], "UA-TEST")
+
+    def test_open_context_uses_capsolver_proxy_for_browser_when_enabled(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class FakeChromium:
+            async def launch_persistent_context(self, **kwargs: object) -> str:
+                calls.append(kwargs)
+                return "context"
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        config = CrawlerConfig(
+            root_url="https://www.nysenate.gov/legislation/laws/CONSOLIDATED",
+            capsolver_proxy="socks5:127.0.0.1:9000:user:pass",
+            capsolver_use_proxy_for_browser=True,
+        )
+        crawler = NYSenatePilotCrawler(config)
+
+        asyncio.run(crawler.open_context(FakePlaywright()))
+
+        self.assertEqual(
+            calls[0]["proxy"],
+            {"server": "socks5://127.0.0.1:9000", "username": "user", "password": "pass"},
+        )
 
     def test_open_context_uses_browser_identity_profile_and_user_agent(self) -> None:
         calls: list[dict[str, object]] = []

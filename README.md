@@ -18,6 +18,7 @@ Minimum files needed to run the crawler on another computer:
 Optional but useful:
 
 - `tests/test_nysenate_pilot_crawler.py`
+- `tmp/make_nysenate_click_capture_report.py`
 - `Learnings from last scrapper/`
 - `Reference code 1/`
 
@@ -86,7 +87,49 @@ Keep your CapSolver key out of Git. The crawler loads it from `CAPSOLVER_API_KEY
 $env:CAPSOLVER_API_KEY = (Get-Content -Raw "captcha key.txt").Trim()
 ```
 
-The current crawler detects human-verification pages and reports whether a CapSolver key is configured.
+The crawler avoids unnecessary paid solves first.
+
+- Normal page -> no CapSolver.
+- Rate limit -> back off, no CapSolver.
+- Slow response -> retry, no CapSolver.
+- Browser profile works -> keep crawling normally.
+- CAPTCHA appears -> CapSolver gets first shot.
+- Cloudflare appears -> CapSolver gets first shot.
+- Human verification appears -> CapSolver gets first shot.
+- CapSolver succeeds -> apply token or cookie.
+- Token applied -> reload target URL.
+- Cookie applied -> reload target URL.
+- Challenge clears -> continue crawling normally.
+- CapSolver fails -> try browser interaction.
+- Browser fallback clears -> continue crawling normally.
+- Everything fails -> save evidence and stop.
+- Checkpoints stay preserved after failure.
+
+CapSolver is configured for real solving.
+
+- Startup -> check CapSolver balance.
+- Balance check -> no solve is spent.
+- Solve attempt -> log task submission.
+- Solve completion -> log task completion.
+- Turnstile -> use proxyless Turnstile task.
+- Cloudflare -> use Cloudflare Challenge task.
+- Cloudflare -> requires static or sticky proxy.
+- Browser proxy -> match CapSolver proxy.
+- Matching proxy -> preserve clearance validity.
+- Returned token -> inject response fields.
+- Returned cookie -> add Playwright cookies.
+- Remaining challenge -> save debug evidence.
+
+Cloudflare managed challenges require a static or sticky proxy in `config/nysenate_crawler.yaml`. By default, the crawler also launches Playwright with this same proxy so CapSolver's clearance cookie matches the browser IP:
+
+```yaml
+captcha:
+  capsolver_proxy: http:host:port:user:pass
+  capsolver_preferred: true
+  capsolver_use_proxy_for_browser: true
+```
+
+Live logs include `Submitting CapSolver task...` and `CapSolver task completed...` lines for every solve attempt. On startup, the crawler also checks `getBalance` and logs the reported balance when `capsolver_log_balance_on_start` is true.
 
 ## Output
 
@@ -113,11 +156,21 @@ The XML fields are:
 python -m unittest tests.test_nysenate_pilot_crawler
 ```
 
+## Generate HTML Evidence Report
+
+To review the navigation rule visually, run the visible-browser report generator:
+
+```powershell
+python tmp\make_nysenate_click_capture_report.py
+```
+
+The script loads `config/nysenate_crawler.yaml`, reuses the crawler selectors and browser settings, and writes a timestamped local report under `evidence/nysenate_click_capture_*/index.html`. The final report section summarizes CAPTCHA/anti-bot settings and any challenge, rate-limit, or timeout signals seen during the evidence run.
+
 ## Notes
 
 - The default config launches real visible Chrome with `channel: chrome` and `headless: false`.
 - User agents are looped through a cursor. Each user agent gets its own `data/sessions/<target>_uaNN_profile/` directory so cookies, local storage, and cache stay matched to that browser identity.
 - For multi-title crawls, `rotate_user_agent_per_title: true` opens the next identity between root law titles.
 - The browser uses `--disable-blink-features=AutomationControlled`, `--start-maximized`, and applies `playwright-stealth` to the shared crawl page when `browser.stealth_enabled` is true.
-- If the site asks for human verification, the crawler stops and preserves checkpoints.
+- If the site asks for human verification, the crawler preserves screenshot/HTML evidence, backs off, and stops with checkpoints preserved if the challenge does not clear.
 - For GitHub, keep `data/`, `logs/`, browser profiles, and secret files out of commits.

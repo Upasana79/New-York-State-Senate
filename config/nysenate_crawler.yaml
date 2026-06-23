@@ -36,8 +36,12 @@ timing:
   selector_timeout_ms: 8000
   navigation_delay_ms: 1000
   content_stable_delay_ms: 1200
+  pre_navigation_delay_min_ms: 1000
+  pre_navigation_delay_max_ms: 3000
   max_retries: 3
   retry_backoff_seconds: 2
+  rate_limit_backoff_base_seconds: 15
+  timeout_backoff_base_seconds: 10
 
 selectors:
   child_links: .nys-openleg-result-item-link
@@ -64,3 +68,16 @@ validation:
 
 captcha:
   capsolver_key_file: captcha key.txt
+  capsolver_api_base: https://api.capsolver.com
+  capsolver_proxy: ""
+  capsolver_poll_interval_seconds: 2
+  capsolver_timeout_seconds: 120
+  capsolver_request_timeout_seconds: 30
+  capsolver_preferred: true
+  capsolver_log_balance_on_start: true
+  capsolver_use_proxy_for_browser: true
+  challenge_interaction_enabled: true
+  challenge_mouse_moves: 4
+  challenge_iframe_timeout_ms: 15000
+  challenge_settle_ms: 10000
+  challenge_cooldown_seconds: 15

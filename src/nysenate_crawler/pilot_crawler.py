@@ -5,8 +5,11 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sys
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -20,10 +23,32 @@ LEVEL_KEYS = [f"level{level}" for level in range(10, 101, 10)]
 LOGGER_NAME = "nysenate_crawler"
 CAPSOLVER_ENV_VAR = "CAPSOLVER_API_KEY"
 DEFAULT_CAPSOLVER_KEY_FILE = Path("captcha key.txt")
+DEFAULT_CAPSOLVER_API_BASE = "https://api.capsolver.com"
+DEFAULT_CAPSOLVER_POLL_INTERVAL_SECONDS = 2.0
+DEFAULT_CAPSOLVER_TIMEOUT_SECONDS = 120.0
+DEFAULT_CAPSOLVER_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--start-maximized",
 ]
+CHALLENGE_STATUS_CODES = {403, 503}
+CHALLENGE_TITLE_MARKERS = (
+    "captcha",
+    "verify you are human",
+    "cloudflare",
+    "just a moment",
+    "verification",
+    "attention required",
+)
+CHALLENGE_BODY_MARKERS = (
+    "captcha",
+    "verify you are human",
+    "checking if you are human",
+    "checking your browser",
+    "cloudflare",
+    "just a moment",
+    "attention required",
+)
 DEFAULT_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
@@ -37,6 +62,10 @@ class MissingDependencyError(RuntimeError):
 
 class HumanVerificationRequired(RuntimeError):
     """Raised when the live site requires manual verification."""
+
+
+class CapSolverError(RuntimeError):
+    """Raised when CapSolver cannot produce or apply a usable solution."""
 
 
 class LevelOverflowError(RuntimeError):
@@ -97,8 +126,12 @@ class CrawlerConfig:
     selector_timeout_ms: int = 8000
     navigation_delay_ms: int = 1000
     content_stable_delay_ms: int = 1200
+    pre_navigation_delay_min_ms: int = 1000
+    pre_navigation_delay_max_ms: int = 3000
     max_retries: int = 3
     retry_backoff_seconds: float = 2.0
+    rate_limit_backoff_base_seconds: float = 15.0
+    timeout_backoff_base_seconds: float = 10.0
     selectors: dict[str, Any] = field(default_factory=dict)
     save_html_on_failure: bool = True
     save_screenshot_on_failure: bool = True
@@ -109,11 +142,34 @@ class CrawlerConfig:
     reject_navigation_pages: bool = True
     capsolver_api_key: str = ""
     capsolver_key_file: Path = DEFAULT_CAPSOLVER_KEY_FILE
+    capsolver_api_base: str = DEFAULT_CAPSOLVER_API_BASE
+    capsolver_proxy: str = ""
+    capsolver_poll_interval_seconds: float = DEFAULT_CAPSOLVER_POLL_INTERVAL_SECONDS
+    capsolver_timeout_seconds: float = DEFAULT_CAPSOLVER_TIMEOUT_SECONDS
+    capsolver_request_timeout_seconds: float = DEFAULT_CAPSOLVER_REQUEST_TIMEOUT_SECONDS
+    capsolver_preferred: bool = True
+    capsolver_log_balance_on_start: bool = True
+    capsolver_use_proxy_for_browser: bool = True
+    challenge_interaction_enabled: bool = True
+    challenge_mouse_moves: int = 4
+    challenge_iframe_timeout_ms: int = 15000
+    challenge_settle_ms: int = 10000
+    challenge_cooldown_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         self.session_target = safe_session_target(self.session_target)
         self.user_agents = user_agents_with_defaults(self.user_agents)
         self.browser_args = browser_args_with_defaults(self.browser_args)
+        self.pre_navigation_delay_min_ms = max(0, int(self.pre_navigation_delay_min_ms))
+        self.pre_navigation_delay_max_ms = max(self.pre_navigation_delay_min_ms, int(self.pre_navigation_delay_max_ms))
+        self.capsolver_api_base = str(self.capsolver_api_base or DEFAULT_CAPSOLVER_API_BASE).rstrip("/")
+        self.capsolver_proxy = clean_text(self.capsolver_proxy)
+        self.capsolver_poll_interval_seconds = max(0.5, float(self.capsolver_poll_interval_seconds))
+        self.capsolver_timeout_seconds = max(self.capsolver_poll_interval_seconds, float(self.capsolver_timeout_seconds))
+        self.capsolver_request_timeout_seconds = max(1.0, float(self.capsolver_request_timeout_seconds))
+        self.challenge_mouse_moves = max(0, int(self.challenge_mouse_moves))
+        self.challenge_iframe_timeout_ms = max(0, int(self.challenge_iframe_timeout_ms))
+        self.challenge_settle_ms = max(0, int(self.challenge_settle_ms))
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "CrawlerConfig":
@@ -155,8 +211,12 @@ class CrawlerConfig:
             selector_timeout_ms=int(timing.get("selector_timeout_ms", 8000)),
             navigation_delay_ms=int(timing.get("navigation_delay_ms", 1000)),
             content_stable_delay_ms=int(timing.get("content_stable_delay_ms", 1200)),
+            pre_navigation_delay_min_ms=int(timing.get("pre_navigation_delay_min_ms", 1000)),
+            pre_navigation_delay_max_ms=int(timing.get("pre_navigation_delay_max_ms", 3000)),
             max_retries=int(timing.get("max_retries", 3)),
             retry_backoff_seconds=float(timing.get("retry_backoff_seconds", 2)),
+            rate_limit_backoff_base_seconds=float(timing.get("rate_limit_backoff_base_seconds", 15)),
+            timeout_backoff_base_seconds=float(timing.get("timeout_backoff_base_seconds", 10)),
             selectors=selectors,
             save_html_on_failure=as_bool(debug.get("save_html_on_failure", True)),
             save_screenshot_on_failure=as_bool(debug.get("save_screenshot_on_failure", True)),
@@ -167,6 +227,19 @@ class CrawlerConfig:
             reject_navigation_pages=as_bool(validation.get("reject_navigation_pages", True)),
             capsolver_api_key=load_capsolver_api_key(capsolver_key_file),
             capsolver_key_file=capsolver_key_file,
+            capsolver_api_base=str(captcha.get("capsolver_api_base", DEFAULT_CAPSOLVER_API_BASE)),
+            capsolver_proxy=clean_text(captcha.get("capsolver_proxy", captcha.get("proxy", ""))),
+            capsolver_poll_interval_seconds=float(captcha.get("capsolver_poll_interval_seconds", DEFAULT_CAPSOLVER_POLL_INTERVAL_SECONDS)),
+            capsolver_timeout_seconds=float(captcha.get("capsolver_timeout_seconds", DEFAULT_CAPSOLVER_TIMEOUT_SECONDS)),
+            capsolver_request_timeout_seconds=float(captcha.get("capsolver_request_timeout_seconds", DEFAULT_CAPSOLVER_REQUEST_TIMEOUT_SECONDS)),
+            capsolver_preferred=as_bool(captcha.get("capsolver_preferred", True)),
+            capsolver_log_balance_on_start=as_bool(captcha.get("capsolver_log_balance_on_start", True)),
+            capsolver_use_proxy_for_browser=as_bool(captcha.get("capsolver_use_proxy_for_browser", True)),
+            challenge_interaction_enabled=as_bool(captcha.get("challenge_interaction_enabled", True)),
+            challenge_mouse_moves=int(captcha.get("challenge_mouse_moves", 4)),
+            challenge_iframe_timeout_ms=int(captcha.get("challenge_iframe_timeout_ms", 15000)),
+            challenge_settle_ms=int(captcha.get("challenge_settle_ms", 10000)),
+            challenge_cooldown_seconds=float(captcha.get("challenge_cooldown_seconds", 15)),
         )
 
     def with_overrides(
@@ -198,6 +271,83 @@ class CrawlerConfig:
         if value:
             return [str(value)]
         return []
+
+
+class CapSolverClient:
+    def __init__(self, api_key: str, *, api_base: str = DEFAULT_CAPSOLVER_API_BASE, request_timeout_seconds: float = DEFAULT_CAPSOLVER_REQUEST_TIMEOUT_SECONDS) -> None:
+        self.api_key = api_key
+        self.api_base = api_base.rstrip("/")
+        self.request_timeout_seconds = request_timeout_seconds
+
+    async def solve_task(self, task: Mapping[str, Any], *, poll_interval_seconds: float, timeout_seconds: float) -> dict[str, Any]:
+        create_response = await self.post_json("createTask", {"clientKey": self.api_key, "task": dict(task)})
+        self.raise_for_capsolver_error(create_response, "createTask")
+        task_id = clean_text(create_response.get("taskId", ""))
+        if not task_id:
+            raise CapSolverError("CapSolver createTask did not return a taskId.")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            result = await self.post_json("getTaskResult", {"clientKey": self.api_key, "taskId": task_id})
+            self.raise_for_capsolver_error(result, "getTaskResult")
+            status = clean_text(result.get("status", "")).lower()
+            if status == "ready":
+                solution = result.get("solution")
+                if not isinstance(solution, Mapping):
+                    raise CapSolverError("CapSolver returned a ready result without a solution object.")
+                return dict(solution)
+            if status not in {"", "idle", "processing"}:
+                raise CapSolverError(f"CapSolver returned unexpected task status {status!r}.")
+            if loop.time() >= deadline:
+                raise CapSolverError(f"CapSolver task {task_id} did not finish within {timeout_seconds:.0f}s.")
+            await asyncio.sleep(poll_interval_seconds)
+
+    async def get_balance(self) -> dict[str, Any]:
+        response = await self.post_json("getBalance", {"clientKey": self.api_key})
+        self.raise_for_capsolver_error(response, "getBalance")
+        return response
+
+    async def post_json(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self._post_json_sync, path, payload)
+
+    def _post_json_sync(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        url = f"{self.api_base}/{path.lstrip('/')}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.request_timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise CapSolverError(f"CapSolver HTTP {exc.code} from {path}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise CapSolverError(f"Could not reach CapSolver {path}: {exc.reason}") from exc
+
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CapSolverError(f"CapSolver {path} returned non-JSON response.") from exc
+        if not isinstance(decoded, Mapping):
+            raise CapSolverError(f"CapSolver {path} returned unexpected JSON.")
+        return dict(decoded)
+
+    @staticmethod
+    def raise_for_capsolver_error(response: Mapping[str, Any], operation: str) -> None:
+        try:
+            error_id = int(response.get("errorId", 0))
+        except (TypeError, ValueError):
+            error_id = 0
+        if error_id == 0:
+            return
+        code = clean_text(response.get("errorCode", "")) or "ERROR_CAPSOLVER"
+        description = clean_text(response.get("errorDescription", ""))
+        detail = f"{code}: {description}" if description else code
+        raise CapSolverError(f"CapSolver {operation} failed: {detail}")
 
 
 class XMLDocumentStore:
@@ -312,6 +462,7 @@ class NYSenatePilotCrawler:
         try:
             self.load_checkpoint()
             self.store.initialize()
+            await self.log_capsolver_readiness()
 
             async with async_playwright() as playwright:
                 context = None
@@ -378,6 +529,34 @@ class NYSenatePilotCrawler:
         write_text_atomic(self.config.visited_file, "\n".join(sorted(self.visited_urls)) + ("\n" if self.visited_urls else ""))
         write_text_atomic(self.config.failed_file, "\n".join(sorted(self.failed_urls)) + ("\n" if self.failed_urls else ""))
 
+    async def log_capsolver_readiness(self) -> None:
+        if not self.config.capsolver_api_key:
+            self.logger.info("CapSolver API key is not configured; challenge solving will use browser fallback only.")
+            return
+        if not self.config.capsolver_log_balance_on_start:
+            self.logger.info("CapSolver API key is configured; startup balance check is disabled.")
+            return
+
+        client = CapSolverClient(
+            self.config.capsolver_api_key,
+            api_base=self.config.capsolver_api_base,
+            request_timeout_seconds=self.config.capsolver_request_timeout_seconds,
+        )
+        try:
+            balance = await client.get_balance()
+        except CapSolverError as exc:
+            self.logger.warning("CapSolver API key is configured, but startup balance check failed: %s", exc)
+            return
+
+        packages = balance.get("packages")
+        package_count = len(packages) if isinstance(packages, list) else 0
+        self.logger.info(
+            "CapSolver ready: balance=%s USD, active package entries=%s, preferred=%s.",
+            balance.get("balance", "unknown"),
+            package_count,
+            self.config.capsolver_preferred,
+        )
+
     def next_browser_identity(self) -> BrowserIdentity:
         index = self.next_user_agent_index()
         user_agent = self.config.user_agents[index]
@@ -441,14 +620,18 @@ class NYSenatePilotCrawler:
         }
         if self.config.channel:
             kwargs["channel"] = self.config.channel
+        proxy = playwright_proxy_from_capsolver_proxy(self.config.capsolver_proxy) if self.config.capsolver_use_proxy_for_browser else {}
+        if proxy:
+            kwargs["proxy"] = proxy
 
         try:
             self.logger.info(
-                "Launching Playwright persistent browser context: channel=%s headless=%s profile=%s user_agent=%s",
+                "Launching Playwright persistent browser context: channel=%s headless=%s profile=%s user_agent=%s proxy=%s",
                 self.config.channel or "default",
                 self.config.headless,
                 user_data_dir,
                 user_agent,
+                proxy.get("server", "none") if proxy else "none",
             )
             return await playwright.chromium.launch_persistent_context(user_data_dir=str(user_data_dir), **kwargs)
         except Exception as exc:
@@ -577,43 +760,350 @@ class NYSenatePilotCrawler:
     async def goto_with_retry(self, page: Any, url: str) -> None:
         last_error: Exception | None = None
         for attempt in range(1, self.config.max_retries + 1):
+            await self.pause_before_navigation(page)
             try:
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+                if response is None:
+                    last_error = RuntimeError("Navigation returned no response.")
+                    wait = self.config.retry_backoff_seconds * attempt
+                    self.logger.warning("No response for %s on attempt %s/%s. Backing off %.1fs.", url, attempt, self.config.max_retries, wait)
+                    if attempt < self.config.max_retries:
+                        await self.wait_seconds(page, wait)
+                    continue
+
                 try:
                     await page.wait_for_load_state("networkidle", timeout=self.config.selector_timeout_ms)
                 except Exception:
                     pass
-                await self.assert_no_human_verification(page, url)
+
                 status = getattr(response, "status", None)
+                title, body = await self.page_verification_text(page)
+
+                if status == 429:
+                    wait = self.config.rate_limit_backoff_base_seconds * (2 ** (attempt - 1))
+                    self.logger.warning("429 Too Many Requests for %s. Backing off %.1fs.", url, wait)
+                    last_error = RuntimeError("HTTP status 429")
+                    if attempt < self.config.max_retries:
+                        await self.wait_seconds(page, wait)
+                    continue
+
+                markers = challenge_markers(status, title, body)
+                if markers:
+                    await self.save_debug(page, "human-verification")
+                    self.logger.warning(
+                        "Human-verification challenge detected for %s on attempt %s/%s: %s",
+                        url,
+                        attempt,
+                        self.config.max_retries,
+                        ", ".join(markers),
+                    )
+                    if await self.try_challenge_solvers(page, url, markers, title, body):
+                        await page.wait_for_timeout(self.config.navigation_delay_ms)
+                        return
+
+                    wait = self.config.challenge_cooldown_seconds
+                    last_error = HumanVerificationRequired(self.human_verification_message(url))
+                    if attempt < self.config.max_retries:
+                        self.logger.warning("Still blocked by human verification. Cooling down %.1fs before retry.", wait)
+                        await self.wait_seconds(page, wait)
+                    continue
+
                 if status and status >= 400:
                     raise RuntimeError(f"HTTP status {status}")
+
                 await page.wait_for_timeout(self.config.navigation_delay_ms)
                 return
-            except HumanVerificationRequired:
-                raise
             except Exception as exc:
                 last_error = exc
-                wait = self.config.retry_backoff_seconds * attempt
-                self.logger.warning("Navigation attempt %s/%s failed for %s: %s", attempt, self.config.max_retries, url, exc)
+                if is_playwright_timeout_error(exc):
+                    wait = self.config.timeout_backoff_base_seconds * (2 ** (attempt - 1))
+                    self.logger.warning("Timeout while navigating to %s on attempt %s/%s. Backing off %.1fs.", url, attempt, self.config.max_retries, wait)
+                else:
+                    wait = self.config.retry_backoff_seconds * attempt
+                    self.logger.warning("Navigation attempt %s/%s failed for %s: %s", attempt, self.config.max_retries, url, exc)
                 if attempt < self.config.max_retries:
-                    await page.wait_for_timeout(int(wait * 1000))
+                    await self.wait_seconds(page, wait)
+
         self.failed_urls.add(canonical_url(url))
+        await self.save_debug(page, "navigation-failed")
+        if isinstance(last_error, HumanVerificationRequired):
+            raise last_error
         raise RuntimeError(f"Could not navigate to {url}") from last_error
 
-    async def assert_no_human_verification(self, page: Any, url: str) -> None:
+    async def pause_before_navigation(self, page: Any) -> None:
+        delay = random.randint(self.config.pre_navigation_delay_min_ms, self.config.pre_navigation_delay_max_ms)
+        if delay > 0:
+            await page.wait_for_timeout(delay)
+
+    async def wait_seconds(self, page: Any, seconds: float) -> None:
+        await page.wait_for_timeout(max(0, int(seconds * 1000)))
+
+    async def page_verification_text(self, page: Any) -> tuple[str, str]:
         title = ""
         body = ""
         try:
             title = await page.title()
+        except Exception:
+            pass
+        try:
             body = await page.locator("body").inner_text(timeout=1000)
         except Exception:
             pass
-        challenge_text = f"{title}\n{body}".lower()
-        if any(marker in challenge_text for marker in ["captcha", "verify you are human", "cloudflare", "just a moment", "attention required"]):
+        return title, body
+
+    async def try_challenge_solvers(self, page: Any, url: str, markers: list[str], title: str, body: str) -> bool:
+        capsolver_error: HumanVerificationRequired | None = None
+
+        if self.config.capsolver_api_key and self.config.capsolver_preferred:
+            try:
+                if await self.try_capsolver_human_verification(page, url, markers, title, body):
+                    return True
+            except HumanVerificationRequired as exc:
+                capsolver_error = exc
+                self.logger.warning("CapSolver did not clear %s before browser fallback: %s", url, exc)
+
+        if await self.try_light_challenge_interaction(page, url):
+            return True
+
+        if self.config.capsolver_api_key and not self.config.capsolver_preferred:
+            if await self.try_capsolver_human_verification(page, url, markers, title, body):
+                return True
+
+        if capsolver_error is not None:
+            raise capsolver_error
+        return False
+
+    async def try_light_challenge_interaction(self, page: Any, url: str) -> bool:
+        if not self.config.challenge_interaction_enabled:
+            return False
+        try:
+            for _ in range(self.config.challenge_mouse_moves):
+                await page.mouse.move(
+                    random.randint(100, min(800, max(100, self.config.viewport_width - 1))),
+                    random.randint(100, min(600, max(100, self.config.viewport_height - 1))),
+                )
+                await page.wait_for_timeout(random.randint(200, 500))
+
+            self.logger.info("Waiting for challenge iframe to appear for %s.", url)
+            await page.wait_for_selector("iframe", state="attached", timeout=self.config.challenge_iframe_timeout_ms)
+            iframe_locator = page.locator("iframe")
+            iframe_count = await iframe_locator.count()
+            self.logger.info("Found %s iframe(s) while checking challenge page for %s.", iframe_count, url)
+
+            for index in range(iframe_count):
+                box = await iframe_locator.nth(index).bounding_box()
+                if not box or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
+                    continue
+                x_offset = min(30, max(1, box["width"] / 2))
+                cx = box["x"] + x_offset
+                cy = box["y"] + box["height"] / 2
+                await page.mouse.move(cx, cy, steps=10)
+                await page.wait_for_timeout(400)
+                await page.mouse.click(cx, cy)
+                self.logger.info("Clicked visible challenge iframe %s for %s.", index, url)
+                break
+        except Exception as exc:
+            self.logger.warning("Could not complete light challenge interaction for %s: %s", url, exc)
+
+        if self.config.challenge_settle_ms > 0:
+            await page.wait_for_timeout(self.config.challenge_settle_ms)
+        title, body = await self.page_verification_text(page)
+        if not challenge_markers(None, title, body):
+            self.logger.info("Human-verification fingerprints cleared for %s.", url)
+            return True
+        return False
+
+    async def try_capsolver_human_verification(self, page: Any, url: str, markers: list[str], title: str, body: str) -> bool:
+        if not self.config.capsolver_api_key:
+            return False
+
+        try:
+            self.logger.info("Attempting CapSolver challenge resolution for %s.", url)
+            turnstile = await self.extract_turnstile_challenge(page)
+            if clean_text(turnstile.get("websiteKey", "")):
+                await self.solve_turnstile_challenge(page, url, turnstile)
+            else:
+                challenge_text = f"{' '.join(markers)}\n{title}\n{body}".lower()
+                if not any(marker in challenge_text for marker in ("cloudflare", "just a moment", "attention required", "http 403", "http 503")):
+                    raise CapSolverError("No supported CAPTCHA parameters were found on the challenge page.")
+                await self.solve_cloudflare_challenge(page, url)
+
+            new_title, new_body = await self.page_verification_text(page)
+            remaining = challenge_markers(None, new_title, new_body)
+            if remaining:
+                await self.save_debug(page, "human-verification-capsolver-remaining")
+                raise CapSolverError(f"solution applied but challenge markers remained: {', '.join(remaining)}")
+
+            self.logger.info("CapSolver cleared human-verification fingerprints for %s.", url)
+            return True
+        except CapSolverError as exc:
+            raise HumanVerificationRequired(f"Human verification required at {url}; CapSolver could not solve it: {exc}") from exc
+
+    async def extract_turnstile_challenge(self, page: Any) -> dict[str, str]:
+        try:
+            raw = await page.evaluate(
+                """
+                () => {
+                  const candidates = Array.from(document.querySelectorAll('.cf-turnstile[data-sitekey], [data-sitekey]'));
+                  for (const node of candidates) {
+                    const websiteKey = node.getAttribute('data-sitekey') || '';
+                    if (websiteKey) {
+                      return {
+                        websiteKey,
+                        action: node.getAttribute('data-action') || '',
+                        cdata: node.getAttribute('data-cdata') || ''
+                      };
+                    }
+                  }
+                  const html = document.documentElement ? document.documentElement.innerHTML : '';
+                  const match = html.match(/data-sitekey=["']([^"']+)["']/i)
+                    || html.match(/["']sitekey["']\\s*[:=]\\s*["']([^"']+)["']/i)
+                    || html.match(/["']siteKey["']\\s*[:=]\\s*["']([^"']+)["']/i);
+                  return match ? { websiteKey: match[1], action: '', cdata: '' } : {};
+                }
+                """
+            )
+        except Exception:
+            return {}
+        if not isinstance(raw, Mapping):
+            return {}
+        return {
+            "websiteKey": clean_text(raw.get("websiteKey", "")),
+            "action": clean_text(raw.get("action", "")),
+            "cdata": clean_text(raw.get("cdata", "")),
+        }
+
+    async def solve_turnstile_challenge(self, page: Any, url: str, challenge: Mapping[str, str]) -> None:
+        task: dict[str, Any] = {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": url,
+            "websiteKey": clean_text(challenge.get("websiteKey", "")),
+        }
+        metadata = {
+            key: clean_text(challenge.get(key, ""))
+            for key in ("action", "cdata")
+            if clean_text(challenge.get(key, ""))
+        }
+        if metadata:
+            task["metadata"] = metadata
+
+        solution = await self.solve_capsolver_task(task)
+        token = clean_text(
+            solution.get("token", "")
+            or solution.get("gRecaptchaResponse", "")
+            or solution.get("captchaToken", "")
+        )
+        if not token:
+            raise CapSolverError("Turnstile task returned no token.")
+
+        await self.apply_turnstile_token(page, token)
+        await page.wait_for_timeout(self.config.challenge_settle_ms)
+
+    async def apply_turnstile_token(self, page: Any, token: str) -> None:
+        await page.evaluate(
+            """
+            (token) => {
+              const responseNames = ['cf-turnstile-response', 'g-recaptcha-response', 'h-captcha-response'];
+              for (const name of responseNames) {
+                const fields = document.querySelectorAll(`textarea[name="${name}"], input[name="${name}"]`);
+                for (const field of fields) {
+                  field.value = token;
+                  field.dispatchEvent(new Event('input', { bubbles: true }));
+                  field.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+              }
+
+              const callbackNames = new Set();
+              for (const node of document.querySelectorAll('[data-callback]')) {
+                const name = node.getAttribute('data-callback');
+                if (name) callbackNames.add(name);
+              }
+              for (const name of callbackNames) {
+                const callback = name.split('.').reduce((value, part) => value && value[part], window);
+                if (typeof callback === 'function') callback(token);
+              }
+
+              const submit = Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"]'))
+                .find((node) => !node.disabled && node.offsetParent !== null);
+              if (submit) submit.click();
+            }
+            """,
+            token,
+        )
+
+    async def solve_cloudflare_challenge(self, page: Any, url: str) -> None:
+        if not self.config.capsolver_proxy:
+            raise CapSolverError("Cloudflare Challenge solving requires captcha.capsolver_proxy to be a static or sticky proxy.")
+
+        task: dict[str, Any] = {
+            "type": "AntiCloudflareTask",
+            "websiteURL": url,
+            "proxy": self.config.capsolver_proxy,
+        }
+        user_agent = await self.browser_user_agent(page)
+        if user_agent:
+            task["userAgent"] = user_agent
+        try:
+            html = await page.content()
+        except Exception:
+            html = ""
+        if html:
+            task["html"] = html
+
+        solution = await self.solve_capsolver_task(task)
+        await self.apply_capsolver_cookies(page, url, solution)
+        await self.reload_after_capsolver(page, url)
+
+    async def browser_user_agent(self, page: Any) -> str:
+        try:
+            return clean_text(await page.evaluate("() => navigator.userAgent"))
+        except Exception:
+            return self.config.user_agents[0] if self.config.user_agents else ""
+
+    async def solve_capsolver_task(self, task: Mapping[str, Any]) -> dict[str, Any]:
+        self.logger.info("Submitting CapSolver task: type=%s websiteURL=%s", task.get("type", "unknown"), task.get("websiteURL", "unknown"))
+        client = CapSolverClient(
+            self.config.capsolver_api_key,
+            api_base=self.config.capsolver_api_base,
+            request_timeout_seconds=self.config.capsolver_request_timeout_seconds,
+        )
+        solution = await client.solve_task(
+            task,
+            poll_interval_seconds=self.config.capsolver_poll_interval_seconds,
+            timeout_seconds=self.config.capsolver_timeout_seconds,
+        )
+        self.logger.info("CapSolver task completed: type=%s websiteURL=%s", task.get("type", "unknown"), task.get("websiteURL", "unknown"))
+        return solution
+
+    async def apply_capsolver_cookies(self, page: Any, url: str, solution: Mapping[str, Any]) -> None:
+        cookies = capsolver_cookie_payloads(solution, url)
+        if not cookies:
+            raise CapSolverError("Cloudflare task returned no cookies or cf_clearance token.")
+        await page.context.add_cookies(cookies)
+
+    async def reload_after_capsolver(self, page: Any, url: str) -> None:
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=self.config.page_load_timeout_ms)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=self.config.selector_timeout_ms)
+        except Exception:
+            pass
+        status = getattr(response, "status", None)
+        if status and status >= 400:
+            self.logger.warning("Reload after CapSolver for %s returned HTTP %s.", url, status)
+
+    def human_verification_message(self, url: str) -> str:
+        if self.config.capsolver_api_key:
+            return f"Human verification required at {url}; CapSolver API key is configured."
+        return f"Human verification required at {url}; no CapSolver API key is configured."
+
+    async def assert_no_human_verification(self, page: Any, url: str) -> None:
+        title, body = await self.page_verification_text(page)
+        markers = challenge_markers(None, title, body)
+        if markers:
             await self.save_debug(page, "human-verification")
-            if self.config.capsolver_api_key:
-                raise HumanVerificationRequired(f"Human verification required at {url}; CapSolver API key is configured.")
-            raise HumanVerificationRequired(f"Human verification required at {url}; no CapSolver API key is configured.")
+            if await self.try_challenge_solvers(page, url, markers, title, body):
+                return
+            raise HumanVerificationRequired(self.human_verification_message(url))
 
     async def dismiss_obstacles(self, page: Any) -> None:
         selectors = [
@@ -748,6 +1238,92 @@ async def first_locator_text(page: Any, selector: str, timeout_ms: int) -> str:
         return clean_text(await locator.inner_text(timeout=timeout_ms))
     except Exception:
         return ""
+
+
+def capsolver_cookie_payloads(solution: Mapping[str, Any], url: str) -> list[dict[str, Any]]:
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}/" if parsed.netloc else url
+    payloads: list[dict[str, Any]] = []
+
+    raw_cookies = solution.get("cookies")
+    if isinstance(raw_cookies, Mapping):
+        for name, value in raw_cookies.items():
+            cookie_name = clean_text(name)
+            cookie_value = clean_text(value)
+            if cookie_name and cookie_value:
+                payloads.append({"name": cookie_name, "value": cookie_value, "url": origin})
+    elif isinstance(raw_cookies, list):
+        for raw_cookie in raw_cookies:
+            if not isinstance(raw_cookie, Mapping):
+                continue
+            cookie_name = clean_text(raw_cookie.get("name", ""))
+            cookie_value = clean_text(raw_cookie.get("value", ""))
+            if not cookie_name or not cookie_value:
+                continue
+            cookie = dict(raw_cookie)
+            cookie["name"] = cookie_name
+            cookie["value"] = cookie_value
+            if not cookie.get("url") and not cookie.get("domain"):
+                cookie["url"] = origin
+            payloads.append(cookie)
+
+    token = clean_text(solution.get("token", ""))
+    if token and not any(cookie.get("name") == "cf_clearance" for cookie in payloads):
+        payloads.append({"name": "cf_clearance", "value": token, "url": origin})
+    return payloads
+
+
+def playwright_proxy_from_capsolver_proxy(proxy: str) -> dict[str, str]:
+    text = clean_text(proxy)
+    if not text:
+        return {}
+
+    scheme = "http"
+    rest = text
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+    else:
+        parts = text.split(":")
+        if parts and parts[0].lower() in {"http", "https", "socks4", "socks5"}:
+            scheme = parts[0].lower()
+            rest = ":".join(parts[1:])
+
+    parts = rest.split(":")
+    if len(parts) < 2:
+        return {}
+
+    host = parts[0].strip()
+    port = parts[1].strip()
+    if not host or not port:
+        return {}
+
+    parsed: dict[str, str] = {"server": f"{scheme}://{host}:{port}"}
+    if len(parts) >= 3 and parts[2]:
+        parsed["username"] = parts[2]
+    if len(parts) >= 4:
+        parsed["password"] = ":".join(parts[3:])
+    return parsed
+
+
+def challenge_markers(status: int | None, title: str, body: str) -> list[str]:
+    markers: list[str] = []
+    if status in CHALLENGE_STATUS_CODES:
+        markers.append(f"HTTP {status}")
+
+    title_text = title.lower()
+    body_text = body.lower()
+    for marker in CHALLENGE_TITLE_MARKERS:
+        if marker in title_text and marker not in markers:
+            markers.append(marker)
+    for marker in CHALLENGE_BODY_MARKERS:
+        if marker in body_text and marker not in markers:
+            markers.append(marker)
+    return markers
+
+
+def is_playwright_timeout_error(exc: Exception) -> bool:
+    error_type = exc.__class__
+    return "timeout" in error_type.__name__.lower() and "playwright" in error_type.__module__.lower()
 
 
 def assign_level(carried_levels: Mapping[str, str], depth: int, current_title: str) -> dict[str, str]:
